@@ -116,6 +116,175 @@ def test_memory_engine_atom_enabled_honors_explicit_false(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_prompt_recall_serves_session_snapshot_while_refresh_runs(
+    tmp_path: Path,
+):
+    engine = MemoryEngine(
+        db_path=str(tmp_path / "prompt_recall_refresh.db"),
+        faiss_db=_FakeFaissDB(),
+        config={
+            "search_cache_enabled": True,
+            "search_cache_ttl_seconds": 60,
+            "search_cache_max_size": 8,
+            "prompt_stale_recall_ttl_seconds": 300,
+            "recent_memory_count": 0,
+        },
+    )
+    await engine.initialize()
+    session_id = "test:private:prompt-refresh"
+    persona_id = "p1"
+    prior_result = Mock(
+        doc_id=1,
+        content="用户喜欢苹果",
+        final_score=0.9,
+        rrf_score=0.9,
+        bm25_score=0.9,
+        vector_score=0.9,
+        metadata={"importance": 0.8},
+        score_breakdown={},
+    )
+    engine.hybrid_retriever.search = AsyncMock(return_value=[prior_result])
+
+    initial = await engine.search_memories(
+        query="苹果",
+        k=3,
+        session_id=session_id,
+        persona_id=persona_id,
+        allow_stale_while_refresh=True,
+    )
+    assert initial == [prior_result]
+
+    first_refresh_started = asyncio.Event()
+    latest_refresh_started = asyncio.Event()
+    finish_first_refresh = asyncio.Event()
+    finish_intermediate_refresh = asyncio.Event()
+    finish_latest_refresh = asyncio.Event()
+    cancelled_queries = []
+    refresh_queries = []
+    banana_result = Mock(
+        doc_id=2,
+        content="用户之前在吃香蕉",
+        final_score=0.9,
+        rrf_score=0.9,
+        bm25_score=0.9,
+        vector_score=0.9,
+        metadata={"importance": 0.8},
+        score_breakdown={},
+    )
+    latest_result = Mock(
+        doc_id=3,
+        content="用户最近在吃葡萄",
+        final_score=0.9,
+        rrf_score=0.9,
+        bm25_score=0.9,
+        vector_score=0.9,
+        metadata={"importance": 0.8},
+        score_breakdown={},
+    )
+
+    async def slow_search(*args, **kwargs):
+        query = args[0]
+        refresh_queries.append(query)
+        if query == "香蕉":
+            first_refresh_started.set()
+            finish = finish_first_refresh
+            result = banana_result
+        elif query == "葡萄":
+            latest_refresh_started.set()
+            finish = finish_latest_refresh
+            result = latest_result
+        else:
+            finish = finish_intermediate_refresh
+            result = banana_result
+        try:
+            await finish.wait()
+        except asyncio.CancelledError:
+            cancelled_queries.append(query)
+            raise
+        return [result]
+
+    engine.hybrid_retriever.search = slow_search
+    next_recall = asyncio.create_task(
+        engine.search_memories(
+            query="香蕉",
+            k=3,
+            session_id=session_id,
+            persona_id=persona_id,
+            allow_stale_while_refresh=True,
+        )
+    )
+    try:
+        await asyncio.wait_for(first_refresh_started.wait(), timeout=1)
+        assert next_recall.done()
+        assert [result.doc_id for result in await next_recall] == [1]
+
+        intermediate_recall = await engine.search_memories(
+            query="橘子",
+            k=3,
+            session_id=session_id,
+            persona_id=persona_id,
+            allow_stale_while_refresh=True,
+        )
+        latest_recall = await engine.search_memories(
+            query="葡萄",
+            k=3,
+            session_id=session_id,
+            persona_id=persona_id,
+            allow_stale_while_refresh=True,
+        )
+        assert [result.doc_id for result in intermediate_recall] == [1]
+        assert [result.doc_id for result in latest_recall] == [1]
+        assert cancelled_queries == []
+
+        finish_first_refresh.set()
+        await asyncio.wait_for(latest_refresh_started.wait(), timeout=1)
+        snapshot = engine._get_prompt_recall_snapshot(session_id, persona_id)
+        assert [result.doc_id for result in snapshot] == [1]
+        assert refresh_queries == ["香蕉", "葡萄"]
+
+        await engine.search_memories(
+            query="橘子",
+            k=3,
+            session_id=session_id,
+            persona_id=persona_id,
+            allow_stale_while_refresh=True,
+        )
+        await engine.search_memories(
+            query="葡萄",
+            k=3,
+            session_id=session_id,
+            persona_id=persona_id,
+            allow_stale_while_refresh=True,
+        )
+        finish_latest_refresh.set()
+        pending = engine._pending_prompt_refreshes.get((session_id, persona_id))
+        if pending is not None:
+            await asyncio.gather(pending[1], return_exceptions=True)
+        assert refresh_queries == ["香蕉", "葡萄"]
+        snapshot = engine._get_prompt_recall_snapshot(session_id, persona_id)
+        assert [result.doc_id for result in snapshot] == [3]
+    finally:
+        finish_first_refresh.set()
+        finish_intermediate_refresh.set()
+        finish_latest_refresh.set()
+        if not next_recall.done():
+            await asyncio.gather(next_recall, return_exceptions=True)
+        pending = engine._pending_prompt_refreshes.get((session_id, persona_id))
+        if pending is not None:
+            await asyncio.gather(pending[1], return_exceptions=True)
+
+    refreshed = await engine.search_memories(
+        query="香蕉",
+        k=3,
+        session_id=session_id,
+        persona_id=persona_id,
+        allow_stale_while_refresh=True,
+    )
+    assert [result.doc_id for result in refreshed] == [2]
+    await engine.close()
+
+
+@pytest.mark.asyncio
 async def test_initialize_drops_legacy_documents_fts_triggers(tmp_path: Path):
     db_path = tmp_path / "legacy_trigger.db"
     async with aiosqlite.connect(db_path) as db:
@@ -786,10 +955,18 @@ async def test_memory_engine_search_cache_reuses_results_and_invalidates_on_writ
     engine.hybrid_retriever.search = counted_search
 
     first = await engine.search_memories(
-        query="苹果", k=3, session_id="test:private:s1", persona_id="p1"
+        query="苹果",
+        k=3,
+        session_id="test:private:s1",
+        persona_id="p1",
+        allow_stale_while_refresh=True,
     )
     second = await engine.search_memories(
-        query="  苹果  ", k=3, session_id="test:private:s1", persona_id="p1"
+        query="  苹果  ",
+        k=3,
+        session_id="test:private:s1",
+        persona_id="p1",
+        allow_stale_while_refresh=True,
     )
     assert [item.doc_id for item in second] == [item.doc_id for item in first]
     assert calls == 1
@@ -802,7 +979,11 @@ async def test_memory_engine_search_cache_reuses_results_and_invalidates_on_writ
         metadata={},
     )
     await engine.search_memories(
-        query="苹果", k=3, session_id="test:private:s1", persona_id="p1"
+        query="苹果",
+        k=3,
+        session_id="test:private:s1",
+        persona_id="p1",
+        allow_stale_while_refresh=True,
     )
     assert calls == 2
 

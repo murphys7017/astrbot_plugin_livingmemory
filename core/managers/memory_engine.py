@@ -163,6 +163,18 @@ class MemoryEngine(
         self._search_cache: OrderedDict[
             tuple[Any, ...], tuple[float, list[HybridResult]]
         ] = OrderedDict()
+        self._prompt_recall_ttl = float(
+            self.config.get("prompt_stale_recall_ttl_seconds", 300.0)
+        )
+        self._prompt_recall_cache: OrderedDict[
+            tuple[str, str], tuple[float, list[HybridResult]]
+        ] = OrderedDict()
+        self._pending_prompt_refreshes: dict[
+            tuple[str, str], tuple[tuple[Any, ...], asyncio.Task]
+        ] = {}
+        self._queued_prompt_refreshes: dict[
+            tuple[str, str], tuple[tuple[Any, ...], str, int, str, str | None]
+        ] = {}
         # 访问统计合并写：同一时间窗口内多次召回只落一次库
         self._access_update_pending: set[int] = set()
         self._access_atom_update_pending: set[int] = set()

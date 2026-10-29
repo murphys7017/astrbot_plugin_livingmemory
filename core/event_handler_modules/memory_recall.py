@@ -265,6 +265,7 @@ class MemoryRecall:
                     k=self.config_manager.get("recall_engine.top_k", 5),
                     session_id=recall_session_id,
                     persona_id=recall_persona_id,
+                    allow_stale_while_refresh=True,
                 )
 
                 if recalled_memories:

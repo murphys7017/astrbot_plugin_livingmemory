@@ -135,6 +135,9 @@ class InitializerFinalizeMixin:
                 "search_cache_max_size": self.config_manager.get(
                     "recall_engine.search_cache_max_size", 256
                 ),
+                "prompt_stale_recall_ttl_seconds": self.config_manager.get(
+                    "recall_engine.prompt_stale_recall_ttl_seconds", 300.0
+                ),
                 "fallback_enabled": self.config_manager.get(
                     "recall_engine.fallback_to_vector", True
                 ),

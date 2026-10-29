@@ -54,6 +54,12 @@ async def test_handle_memory_recall_injects_extra_user_content(handler, memory_e
         await handler.handle_memory_recall(event, req)
 
     memory_engine.search_memories.assert_awaited_once()
+    assert (
+        memory_engine.search_memories.await_args.kwargs[
+            "allow_stale_while_refresh"
+        ]
+        is True
+    )
     assert len(req.extra_user_content_parts) == 1
     text_part = req.extra_user_content_parts[0]
     assert "<RAG-Faiss-Memory>" in text_part.text

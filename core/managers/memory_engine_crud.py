@@ -379,6 +379,8 @@ class MemoryEngineCrudMixin:
         k: int = 5,
         session_id: str | None = None,
         persona_id: str | None = None,
+        *,
+        allow_stale_while_refresh: bool = False,
     ) -> list[HybridResult]:
         """
         检索相关记忆
@@ -398,16 +400,33 @@ class MemoryEngineCrudMixin:
         cache_key = self._search_cache_key(query, k, session_id, persona_id)
         cached_results = self._get_cached_search_results(cache_key)
         if cached_results is not None:
-            cached_results = await self._apply_atom_policy(cached_results)
-            await self._update_access_times_internal(
-                [result.doc_id for result in cached_results],
-                [
-                    atom_id
-                    for result in cached_results
-                    for atom_id in result.metadata.get("retrieved_atom_ids", [])
-                ],
+            if allow_stale_while_refresh:
+                self._remember_prompt_recall_snapshot(
+                    session_id,
+                    persona_id,
+                    cached_results,
+                    generation=cache_key[0],
+                )
+            cached_results = await self._prepare_cached_search_results(
+                cached_results
             )
             return cached_results
+
+        if allow_stale_while_refresh:
+            stale_results = self._get_prompt_recall_snapshot(session_id, persona_id)
+            if stale_results is not None:
+                self._schedule_prompt_recall_refresh(
+                    cache_key,
+                    query,
+                    k,
+                    session_id,
+                    persona_id,
+                )
+                logger.debug(
+                    f"使用最近的会话记忆并后台刷新: "
+                    f"session_id={session_id} persona_id={persona_id}"
+                )
+                return await self._prepare_cached_search_results(stale_results[:k])
 
         # 如果session_id是unified_msg_origin格式，自动触发旧数据迁移
         if (
@@ -504,6 +523,28 @@ class MemoryEngineCrudMixin:
             )
 
         self._set_cached_search_results(cache_key, results)
+        if allow_stale_while_refresh:
+            self._remember_prompt_recall_snapshot(
+                session_id,
+                persona_id,
+                results,
+                generation=cache_key[0],
+            )
+        return results
+
+    async def _prepare_cached_search_results(
+        self,
+        results: list[HybridResult],
+    ) -> list[HybridResult]:
+        results = await self._apply_atom_policy(results)
+        await self._update_access_times_internal(
+            [result.doc_id for result in results],
+            [
+                atom_id
+                for result in results
+                for atom_id in result.metadata.get("retrieved_atom_ids", [])
+            ],
+        )
         return results
 
     async def _apply_atom_policy(self, results, skip_doc_ids: set[int] | None = None):
