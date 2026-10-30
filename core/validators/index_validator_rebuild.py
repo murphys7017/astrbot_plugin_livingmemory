@@ -3,17 +3,23 @@ IndexValidator 的 IndexValidatorRebuildMixin 拆分模块
 自动从 core/validators/index_validator.py 拆分，保持行为不变
 """
 
-import aiosqlite
-from typing import Any, cast
 import asyncio
 import json
-from astrbot.api import logger
 import os
 import time
+from typing import Any, cast
 
+import aiosqlite
+
+from astrbot.api import logger
+
+from ...storage.schema import MIGRATION_STATUS_SCHEMA_STATEMENTS
+from ...storage.sqlite_config import (
+    SQLITE_BUSY_TIMEOUT_MS,
+    SQLITE_CONNECTION_TIMEOUT_SECONDS,
+)
 from ..faiss_async_persist import get_async_persister
 from ..utils.faiss_path_bridge import read_index_safe, write_index_safe
-from ...storage.schema import MIGRATION_STATUS_SCHEMA_STATEMENTS
 
 
 class IndexValidatorRebuildMixin:
@@ -21,8 +27,10 @@ class IndexValidatorRebuildMixin:
     async def _create_bm25_shadow(self, table_name: str) -> str:
         """Create a fresh FTS5 table without touching the live index."""
         shadow_table = f"{table_name}_rebuild"
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("PRAGMA busy_timeout = 10000")
+        async with aiosqlite.connect(
+            self.db_path, timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS
+        ) as db:
+            await db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
             await db.execute(f"DROP TABLE IF EXISTS {shadow_table}")
             await db.execute(
                 f"""
@@ -38,16 +46,20 @@ class IndexValidatorRebuildMixin:
         return shadow_table
 
     async def _drop_bm25_shadow(self, shadow_table: str) -> None:
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("PRAGMA busy_timeout = 10000")
+        async with aiosqlite.connect(
+            self.db_path, timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS
+        ) as db:
+            await db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
             await db.execute(f"DROP TABLE IF EXISTS {shadow_table}")
             await db.commit()
 
     async def _switch_bm25_shadow(self, live_table: str, shadow_table: str) -> None:
         """Atomically replace the live FTS table after a complete build."""
         old_table = f"{live_table}_previous"
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("PRAGMA busy_timeout = 10000")
+        async with aiosqlite.connect(
+            self.db_path, timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS
+        ) as db:
+            await db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
             await db.execute("BEGIN IMMEDIATE")
             try:
                 await db.execute(f"DROP TABLE IF EXISTS {old_table}")
@@ -60,8 +72,10 @@ class IndexValidatorRebuildMixin:
 
         # Keep the switch transaction short. The previous generation can be
         # dropped after readers have observed the new schema.
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("PRAGMA busy_timeout = 10000")
+        async with aiosqlite.connect(
+            self.db_path, timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS
+        ) as db:
+            await db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
             await db.execute(f"DROP TABLE IF EXISTS {old_table}")
             await db.commit()
 
@@ -127,7 +141,9 @@ class IndexValidatorRebuildMixin:
         return errors / total
 
     async def _get_document_count(self) -> int:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(
+            self.db_path, timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS
+        ) as db:
             cursor = await db.execute(
                 f"SELECT COUNT(*) FROM documents WHERE {self.ACTIVE_DOCUMENT_SQL}"
             )
@@ -135,7 +151,9 @@ class IndexValidatorRebuildMixin:
             return int(row[0]) if row else 0
 
     async def _get_document_ids(self) -> set[int]:
-        async with aiosqlite.connect(self.db_path) as db:
+        async with aiosqlite.connect(
+            self.db_path, timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS
+        ) as db:
             cursor = await db.execute(
                 f"SELECT id FROM documents WHERE {self.ACTIVE_DOCUMENT_SQL}"
             )
@@ -147,8 +165,10 @@ class IndexValidatorRebuildMixin:
         document_ids: set[int] | None = None,
     ):
         # 复用单个连接遍历所有批次，避免每批重建连接带来的开销。
-        async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("PRAGMA busy_timeout = 10000")
+        async with aiosqlite.connect(
+            self.db_path, timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS
+        ) as db:
+            await db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
 
             if document_ids is not None:
                 sorted_ids = sorted(int(doc_id) for doc_id in document_ids)
@@ -233,8 +253,10 @@ class IndexValidatorRebuildMixin:
         failed_ids: set[int] = set()
         switched = False
 
-        insert_db = await aiosqlite.connect(self.db_path)
-        await insert_db.execute("PRAGMA busy_timeout = 10000")
+        insert_db = await aiosqlite.connect(
+            self.db_path, timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS
+        )
+        await insert_db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
         try:
             async for batch in self._iter_document_batches(batch_size):
                 rows_to_insert: list[tuple[int, str]] = []

@@ -9,9 +9,11 @@ from typing import Any
 
 import aiosqlite
 
-from .graph_store_write import GraphStoreWriteMixin
 from .graph_store_read import GraphStoreReadMixin
 from .graph_store_snapshot import GraphStoreSnapshotMixin
+from .graph_store_write import GraphStoreWriteMixin
+from .sqlite_config import SQLITE_BUSY_TIMEOUT_MS, SQLITE_CONNECTION_TIMEOUT_SECONDS
+
 
 class GraphStore(GraphStoreWriteMixin, GraphStoreReadMixin, GraphStoreSnapshotMixin):
     """Persist graph nodes, edges, and searchable entries."""
@@ -31,10 +33,12 @@ class GraphStore(GraphStoreWriteMixin, GraphStoreReadMixin, GraphStoreSnapshotMi
     @asynccontextmanager
     async def _connect(self):
         """创建新的SQLite连接并启用WAL模式和busy_timeout。"""
-        db = await aiosqlite.connect(self.db_path)
+        db = await aiosqlite.connect(
+            self.db_path, timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS
+        )
         try:
             await db.execute("PRAGMA journal_mode = WAL")
-            await db.execute("PRAGMA busy_timeout = 10000")
+            await db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
             await db.execute("PRAGMA foreign_keys = ON")
             yield db
         finally:
@@ -48,8 +52,10 @@ class GraphStore(GraphStoreWriteMixin, GraphStoreReadMixin, GraphStoreSnapshotMi
                 yield db
             return
         if self._read_conn is None:
-            db = await aiosqlite.connect(self.db_path)
-            await db.execute("PRAGMA busy_timeout = 10000")
+            db = await aiosqlite.connect(
+                self.db_path, timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS
+            )
+            await db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
             self._read_conn = db
         yield self._read_conn
 

@@ -120,6 +120,12 @@ class RecallEngineConfig(BaseModel):
     search_cache_max_size: int = Field(
         default=256, ge=0, le=10000, description="检索缓存最大条目数"
     )
+    prompt_stale_recall_ttl_seconds: float = Field(
+        default=300.0,
+        ge=0.0,
+        le=3600.0,
+        description="提示词召回可复用旧结果的最长时间；0 表示关闭",
+    )
     fusion_mode: str = Field(
         default="score",
         description="结果融合策略：score=分数归一化加权融合，rrf=排名级 RRF",

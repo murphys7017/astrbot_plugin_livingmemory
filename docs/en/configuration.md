@@ -90,7 +90,7 @@ Aliases are matched in this order: `platform:user ID`, user ID, then current use
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `reflection_engine.summary_trigger_rounds` | `10` | Number of conversation rounds before summarization |
+| `reflection_engine.summary_trigger_rounds` | `10` | Rounds before summarization: a user/assistant pair in private chats, or one member message in group chats; bot replies do not add group rounds |
 | `reflection_engine.max_segments_per_run` | `10` | Maximum split segments summarized by one trigger; remaining backlog waits for the next trigger |
 | `reflection_engine.window_split_by_day` | `true` | Summarizes only the oldest day when a window crosses midnight, so multi-day chats are not merged into one memory |
 | `reflection_engine.window_split_gap_minutes` | `180` | Summarizes only the oldest segment when the idle gap between messages exceeds this many minutes; `0` disables gap splitting |

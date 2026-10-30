@@ -214,7 +214,6 @@ class MemoryProcessor(MemoryProcessorParseMixin, MemoryProcessorBuildMixin):
                 f"[MemoryProcessor] 成功加载人格 '{persona_id}' 的提示词 "
                 f"(长度={len(persona_prompt)}字符)"
             )
-            logger.debug(f"[MemoryProcessor] 人格提示词预览: {persona_prompt[:100]}...")
 
             # 使用 PromptManager 模板构建增强提示词
             try:
@@ -476,12 +475,14 @@ class MemoryProcessor(MemoryProcessorParseMixin, MemoryProcessorBuildMixin):
             )
             logger.debug(f"[MemoryProcessor] Prompt 模板长度={len(prompt)}")
             logger.debug(
-                f"[MemoryProcessor] 发送给LLM的对话内容（前500字符）:\n{conversation_text[:500]}"
+                f"[MemoryProcessor] 对话内容长度={len(conversation_text)}字符"
             )
 
             # 构建 system_prompt，嵌入人格提示
             system_prompt = await self._build_system_prompt_with_persona(persona_id)
-            logger.debug(f"[MemoryProcessor] System Prompt: {system_prompt[:200]}...")
+            logger.debug(
+                f"[MemoryProcessor] System Prompt 长度={len(system_prompt)}字符"
+            )
 
             llm_response_text = await self._call_llm_with_retry(
                 prompt=prompt,
@@ -491,7 +492,6 @@ class MemoryProcessor(MemoryProcessorParseMixin, MemoryProcessorBuildMixin):
             logger.info(
                 f"[MemoryProcessor]  LLM 响应成功，响应长度={len(llm_response_text)}"
             )
-            logger.debug(f"[MemoryProcessor] LLM 原始响应内容:\n{llm_response_text}")
 
             # 4. 解析LLM响应
             structured_data = self._parse_llm_response(llm_response_text, is_group_chat)
@@ -521,14 +521,18 @@ class MemoryProcessor(MemoryProcessorParseMixin, MemoryProcessorBuildMixin):
             metadata["summary_quality"] = structured_data.get("_quality", "normal")
 
             importance = float(structured_data.get("importance", 0.5))
+            summary = str(structured_data.get("summary", ""))
+            topics = structured_data.get("topics", [])
+            key_facts = structured_data.get("key_facts", [])
 
             logger.info(
-                f"[MemoryProcessor]  成功生成结构化记忆: 摘要={structured_data.get('summary', '')[:50]}..., "
-                f"主题={structured_data.get('topics', [])}, "
-                f"重要性={importance}, 类型={conversation_type}"
-            )
-            logger.debug(
-                f"[MemoryProcessor] 生成的记忆内容（前200字符）:\n{content[:200]}"
+                "[MemoryProcessor] 成功生成结构化记忆: summary_chars=%d "
+                "topic_count=%d key_fact_count=%d importance=%.2f type=%s",
+                len(summary),
+                len(topics) if isinstance(topics, list) else 0,
+                len(key_facts) if isinstance(key_facts, list) else 0,
+                importance,
+                conversation_type,
             )
 
             return content, metadata, importance

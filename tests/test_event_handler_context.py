@@ -274,14 +274,19 @@ async def test_context_expansion_skips_when_empty(
 
 
 @pytest.mark.asyncio
-async def test_pending_summary_retry_max_abandons(
+async def test_pending_summary_retry_max_preserves_range_during_cooldown(
     handler, conversation_manager, memory_engine
 ):
-    """retry_count >= 3 时应放弃该范围，更新 last_summarized_index 并跳过总结。"""
+    """retry_count >= 3 时冷却并保留 pending 范围及游标。"""
     conversation_manager.get_session_metadata = AsyncMock(
         side_effect=lambda sid, key, default=None: {
             "last_summarized_index": 0,
-            "pending_summary": {"start_index": 2, "end_index": 10, "retry_count": 3},
+            "pending_summary": {
+                "start_index": 2,
+                "end_index": 10,
+                "retry_count": 3,
+                "retry_after": 4_000_000_000,
+            },
         }.get(key, default)
     )
     conversation_manager.store.get_message_count = AsyncMock(return_value=12)
@@ -296,21 +301,7 @@ async def test_pending_summary_retry_max_abandons(
         get_persona.return_value = "persona_1"
         await handler.handle_memory_reflection(event, resp)
 
-    # 验证 pending_summary 被清除
-    clear_calls = [
-        c
-        for c in conversation_manager.update_session_metadata.await_args_list
-        if c.args[1] == "pending_summary"
-    ]
-    assert len(clear_calls) >= 1
-    # 验证 last_summarized_index 被更新到 end_index
-    skip_calls = [
-        c
-        for c in conversation_manager.update_session_metadata.await_args_list
-        if c.args[1] == "last_summarized_index"
-    ]
-    assert any(c.args[2] == 12 for c in skip_calls)
-    # 不应触发记忆总结
+    conversation_manager.update_session_metadata.assert_not_awaited()
     memory_engine.add_memory.assert_not_awaited()
 
 

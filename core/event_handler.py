@@ -95,6 +95,7 @@ class EventHandler:
     async def handle_all_group_messages(self, event: AstrMessageEvent):
         """Capture all group messages for memory storage"""
         await self._group_capture.handle_all_group_messages(event)
+        await self._memory_reflection.handle_group_capture(event)
 
     async def handle_memory_recall(self, event: AstrMessageEvent, req: ProviderRequest):
         """Query and inject long-term memory before LLM request"""

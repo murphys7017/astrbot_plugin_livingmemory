@@ -93,9 +93,7 @@ class GroupCapture:
             await self.message_utils.enforce_message_limit(session_id)
 
             logger.debug(
-                f"[{session_id}] 捕获群聊消息: "
-                f"sender={event.get_sender_name()}({event.get_sender_id()}), "
-                f"content={content[:50]}..."
+                f"[{session_id}] 捕获群聊消息，内容长度={len(content)}字符"
             )
 
         except asyncio.CancelledError:

@@ -9,18 +9,21 @@ import time
 from dataclasses import replace
 from typing import Any
 
+import aiosqlite
+
 from astrbot.api import logger
 
+from ...storage.atom_store import AtomStore
+from ...storage.sqlite_config import (
+    SQLITE_BUSY_TIMEOUT_MS,
+    SQLITE_CONNECTION_TIMEOUT_SECONDS,
+)
 from ..memory_transfer import memory_import_key
 from ..processors.atom_classifier import classify_atoms
 from ..retrieval.hybrid_retriever import HybridResult
 from ..retrieval.route_execution import search_route
 from ..utils.json_utils import safe_json_dict
 from ..utils.number_utils import clamp_float, safe_float
-from ...storage.atom_store import AtomStore
-
-import aiosqlite
-
 from .agentic_recall_types import AgenticRecallOutcome as AgenticRecallOutcome
 
 
@@ -185,7 +188,7 @@ class MemoryEngineCrudMixin:
                     raise
                 except Exception:
                     logger.error(
-                        f"[MemoryEngine] 写入记忆原子失败: {atom.content[:80]}",
+                        "[MemoryEngine] 写入记忆原子失败",
                         exc_info=True,
                     )
 
@@ -379,6 +382,8 @@ class MemoryEngineCrudMixin:
         k: int = 5,
         session_id: str | None = None,
         persona_id: str | None = None,
+        *,
+        allow_stale_while_refresh: bool = False,
     ) -> list[HybridResult]:
         """
         检索相关记忆
@@ -398,16 +403,33 @@ class MemoryEngineCrudMixin:
         cache_key = self._search_cache_key(query, k, session_id, persona_id)
         cached_results = self._get_cached_search_results(cache_key)
         if cached_results is not None:
-            cached_results = await self._apply_atom_policy(cached_results)
-            await self._update_access_times_internal(
-                [result.doc_id for result in cached_results],
-                [
-                    atom_id
-                    for result in cached_results
-                    for atom_id in result.metadata.get("retrieved_atom_ids", [])
-                ],
+            if allow_stale_while_refresh:
+                self._remember_prompt_recall_snapshot(
+                    session_id,
+                    persona_id,
+                    cached_results,
+                    generation=cache_key[0],
+                )
+            cached_results = await self._prepare_cached_search_results(
+                cached_results
             )
             return cached_results
+
+        if allow_stale_while_refresh:
+            stale_results = self._get_prompt_recall_snapshot(session_id, persona_id)
+            if stale_results is not None:
+                self._schedule_prompt_recall_refresh(
+                    cache_key,
+                    query,
+                    k,
+                    session_id,
+                    persona_id,
+                )
+                logger.debug(
+                    f"使用最近的会话记忆并后台刷新: "
+                    f"session_id={session_id} persona_id={persona_id}"
+                )
+                return await self._prepare_cached_search_results(stale_results[:k])
 
         # 如果session_id是unified_msg_origin格式，自动触发旧数据迁移
         if (
@@ -504,6 +526,28 @@ class MemoryEngineCrudMixin:
             )
 
         self._set_cached_search_results(cache_key, results)
+        if allow_stale_while_refresh:
+            self._remember_prompt_recall_snapshot(
+                session_id,
+                persona_id,
+                results,
+                generation=cache_key[0],
+            )
+        return results
+
+    async def _prepare_cached_search_results(
+        self,
+        results: list[HybridResult],
+    ) -> list[HybridResult]:
+        results = await self._apply_atom_policy(results)
+        await self._update_access_times_internal(
+            [result.doc_id for result in results],
+            [
+                atom_id
+                for result in results
+                for atom_id in result.metadata.get("retrieved_atom_ids", [])
+            ],
+        )
         return results
 
     async def _apply_atom_policy(self, results, skip_doc_ids: set[int] | None = None):
@@ -991,7 +1035,7 @@ class MemoryEngineCrudMixin:
                 raise
             except Exception:
                 logger.warning(
-                    f"[MemoryEngine] 合并记忆原子失败 (memory_id={memory_id}): {content[:60]}",
+                    f"[MemoryEngine] 合并记忆原子失败 (memory_id={memory_id})",
                     exc_info=True,
                 )
 
@@ -1493,10 +1537,16 @@ class MemoryEngineCrudMixin:
 
         current_time = time.time()
         try:
-            # 单条原子 SQL，避免并发召回任务对同一记忆产生丢失更新
-            placeholders = ",".join("?" * len(unique_ids))
-            async with self._write_transaction() as connection:
-                cursor = await connection.execute(
+            # Keep best-effort recall writes off the long-lived engine connection,
+            # so a failed update cannot leave another operation's transaction open.
+            async with aiosqlite.connect(
+                self.db_path, timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS
+            ) as db:
+                await db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+
+                # Single atomic UPDATE prevents concurrent recalls losing increments.
+                placeholders = ",".join("?" * len(unique_ids))
+                cursor = await db.execute(
                     f"""
                     UPDATE documents
                     SET metadata = CASE
@@ -1521,12 +1571,13 @@ class MemoryEngineCrudMixin:
                     unique_atoms = list(
                         dict.fromkeys(int(atom_id) for atom_id in atom_ids)
                     )
-                    await connection.execute(
+                    await db.execute(
                         f"UPDATE memory_atoms SET last_accessed_at = ? "
                         f"WHERE id IN ({','.join('?' for _ in unique_atoms)}) "
                         "AND status = 'active' AND expires_at > ?",
                         (current_time, *unique_atoms, current_time),
                     )
+                await db.commit()
             return cursor.rowcount > 0
         except asyncio.CancelledError:
             raise

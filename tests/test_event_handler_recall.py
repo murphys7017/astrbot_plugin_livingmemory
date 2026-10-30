@@ -54,12 +54,43 @@ async def test_handle_memory_recall_injects_extra_user_content(handler, memory_e
         await handler.handle_memory_recall(event, req)
 
     memory_engine.search_memories.assert_awaited_once()
+    assert (
+        memory_engine.search_memories.await_args.kwargs[
+            "allow_stale_while_refresh"
+        ]
+        is True
+    )
     assert len(req.extra_user_content_parts) == 1
     text_part = req.extra_user_content_parts[0]
     assert "<RAG-Faiss-Memory>" in text_part.text
     assert getattr(text_part, "_no_save", False) is True
     # system_prompt 不应被修改
     assert req.system_prompt == ""
+
+
+@pytest.mark.asyncio
+async def test_handle_memory_recall_does_not_log_query_text(handler, memory_engine):
+    marker = "private-query-marker-2026"
+    event = _make_event(group=False)
+    event.get_message_str.return_value = marker
+    req = _make_req(marker)
+    memory_engine.search_memories = AsyncMock(return_value=[])
+
+    with (
+        patch(
+            "astrbot_plugin_livingmemory.core.event_handler_modules.memory_recall.get_persona_id",
+            new_callable=AsyncMock,
+        ) as get_persona,
+        patch(
+            "astrbot_plugin_livingmemory.core.event_handler_modules.memory_recall.logger"
+        ) as recall_logger,
+    ):
+        get_persona.return_value = "persona_1"
+        await handler.handle_memory_recall(event, req)
+
+    logged = repr(recall_logger.mock_calls)
+    assert marker not in logged
+    assert "查询长度=" in logged
 
 
 @pytest.mark.asyncio
@@ -526,7 +557,7 @@ async def test_handle_memory_reflection_skips_empty_response(
 async def test_handle_memory_reflection_pending_retry_exceeds_max(
     handler, conversation_manager, memory_engine
 ):
-    """待处理失败总结重试次数 >= 3 时，应放弃并清除 pending_summary。"""
+    """待处理总结冷却期间保留 pending 范围和未总结游标。"""
     event = _make_event(group=False)
     resp = _make_resp("assistant answer")
 
@@ -537,6 +568,7 @@ async def test_handle_memory_reflection_pending_retry_exceeds_max(
             "start_index": 0,
             "end_index": 2,
             "retry_count": 3,
+            "retry_after": 4_000_000_000,
         },
     }
 
@@ -557,9 +589,8 @@ async def test_handle_memory_reflection_pending_retry_exceeds_max(
         get_persona.return_value = "p1"
         await handler.handle_memory_reflection(event, resp)
 
-    # pending_summary 应被清除
-    assert session_metadata.get("pending_summary") is None
-    # add_memory 不应被调用（放弃了该范围）
+    assert session_metadata["pending_summary"]["retry_count"] == 3
+    assert session_metadata["last_summarized_index"] == 0
     memory_engine.add_memory.assert_not_awaited()
 
 

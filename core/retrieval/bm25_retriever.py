@@ -13,8 +13,11 @@ import aiosqlite
 
 from astrbot.api import logger
 
+from ...storage.sqlite_config import (
+    SQLITE_BUSY_TIMEOUT_MS,
+    SQLITE_CONNECTION_TIMEOUT_SECONDS,
+)
 from ..processors.text_processor import TextProcessor
-
 
 _CJK_RUN = re.compile(r"[一-鿿]+")
 
@@ -83,10 +86,12 @@ class BM25Retriever:
     @asynccontextmanager
     async def _connect(self):
         """创建新的SQLite连接并启用WAL模式和busy_timeout。"""
-        db = await aiosqlite.connect(self.db_path)
+        db = await aiosqlite.connect(
+            self.db_path, timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS
+        )
         try:
             await db.execute("PRAGMA journal_mode = WAL")
-            await db.execute("PRAGMA busy_timeout = 10000")
+            await db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
             yield db
         finally:
             await db.close()

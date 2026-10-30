@@ -90,7 +90,7 @@ LivingMemory 的默认配置已经适合大多数场景。真正需要调整的�
 
 | 配置项 | 默认 | 说明 |
 | --- | --- | --- |
-| `reflection_engine.summary_trigger_rounds` | `10` | 达到多少轮对话后触发总结 |
+| `reflection_engine.summary_trigger_rounds` | `10` | 达到多少轮后触发总结；私聊按一问一答计轮，群聊按成员发言计轮 |
 | `reflection_engine.max_segments_per_run` | `10` | 单次触发最多连续总结的切分片段数；达到上限后剩余积压留到下次触发 |
 | `reflection_engine.window_split_by_day` | `true` | 跨天时只总结最老的一天，避免跨天对话合并进同一条记忆 |
 | `reflection_engine.window_split_gap_minutes` | `180` | 相邻消息空闲间隔超过该分钟数时只总结最老片段；`0` 关闭空闲间隔切分 |

@@ -198,6 +198,42 @@ class ConversationStoreMessagesMixin:
                 return int(count_value) if count_value is not None else 0
             return 0
 
+    async def get_message_count_by_role(
+        self,
+        session_id: str,
+        role: str,
+        start_index: int = 0,
+        end_index: int | None = None,
+    ) -> int:
+        """Count messages of one role within the chronological message range."""
+        if self.connection is None:
+            return 0
+
+        start_index = max(0, int(start_index))
+        limit = -1 if end_index is None else max(0, int(end_index) - start_index)
+        if limit == 0:
+            return 0
+
+        async with self.connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM (
+                SELECT role
+                FROM messages
+                WHERE session_id = ?
+                ORDER BY timestamp ASC, id ASC
+                LIMIT ? OFFSET ?
+            ) AS message_range
+            WHERE role = ?
+            """,
+            (session_id, limit, start_index, role),
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row and "count" in row.keys():
+                count_value = row["count"]
+                return int(count_value) if count_value is not None else 0
+            return 0
+
     async def trim_session_messages(
         self,
         session_id: str,

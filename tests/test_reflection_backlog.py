@@ -2,9 +2,11 @@
 
 import asyncio
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from astrbot.api.platform import MessageType
 
 from tests.event_handler_support import _make_real_handler
 
@@ -52,6 +54,28 @@ async def _build_plan(handler, session_id: str, total_messages: int):
 async def _run_scheduled(handler, plan) -> None:
     await handler._memory_reflection._schedule_reflection(plan)
     await asyncio.gather(*list(handler._storage_tasks))
+
+
+def _passive_group_event(session_id: str, message_id: str):
+    from astrbot.core.message.components import Plain
+
+    event = Mock()
+    event.unified_msg_origin = session_id
+    event.message_obj = SimpleNamespace(
+        message_id=message_id,
+        timestamp=_day(26, 0, 20),
+        sender=SimpleNamespace(user_id="user-2", nickname="Member 2"),
+    )
+    event.get_message_type.return_value = MessageType.GROUP_MESSAGE
+    event.get_sender_id.return_value = "user-2"
+    event.get_self_id.return_value = "bot-1"
+    event.get_sender_name.return_value = "Member 2"
+    event.get_platform_name.return_value = "test"
+    event.get_group_id.return_value = session_id
+    event.get_messages.return_value = [Plain("a passive group message")]
+    event.get_message_str.return_value = "a passive group message"
+    event.get_extra.side_effect = lambda key, default=None: default
+    return event
 
 
 @pytest.mark.asyncio
@@ -165,6 +189,106 @@ async def test_backlog_stops_when_segment_fails(tmp_path):
             session_id, "pending_summary", None
         ) == {"start_index": 0, "end_index": 4, "retry_count": 1}
         handler.memory_engine.add_memory.assert_not_awaited()
+    finally:
+        await handler.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_passive_group_capture_summarizes_without_bot_reply(tmp_path):
+    handler, manager, store = await _make_real_handler(tmp_path)
+    session_id = "test:group:passive-summary"
+    handler.config_manager._config["reflection_engine"][
+        "summary_trigger_rounds"
+    ] = 1
+    await _seed_messages(
+        manager,
+        session_id,
+        [_day(26, 0, 0), _day(26, 0, 5)],
+    )
+    _configure_processor(handler)
+    handler.memory_engine.find_similar_memory = AsyncMock(return_value=None)
+    handler.memory_engine.add_memory = AsyncMock(return_value=1)
+
+    try:
+        await handler.handle_all_group_messages(
+            _passive_group_event(session_id, "passive-1")
+        )
+        await asyncio.gather(*list(handler._storage_tasks))
+
+        assert handler.memory_processor.process_conversation.await_count == 1
+        assert await manager.get_session_metadata(
+            session_id, "last_summarized_index", 0
+        ) == 3
+    finally:
+        await handler.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_group_summary_threshold_counts_member_messages(tmp_path):
+    handler, manager, store = await _make_real_handler(tmp_path)
+    session_id = "test:group:member-message-threshold"
+    handler.config_manager._config["reflection_engine"][
+        "summary_trigger_rounds"
+    ] = 2
+    _configure_processor(handler)
+    handler.memory_engine.find_similar_memory = AsyncMock(return_value=None)
+    handler.memory_engine.add_memory = AsyncMock(return_value=1)
+
+    try:
+        await handler.handle_all_group_messages(
+            _passive_group_event(session_id, "passive-threshold-1")
+        )
+        assert not handler._storage_tasks
+
+        await handler.handle_all_group_messages(
+            _passive_group_event(session_id, "passive-threshold-2")
+        )
+        await asyncio.gather(*list(handler._storage_tasks))
+
+        assert handler.memory_processor.process_conversation.await_count == 1
+        assert await manager.get_session_metadata(
+            session_id, "last_summarized_index", 0
+        ) == 2
+    finally:
+        await handler.shutdown()
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_group_summary_keeps_messages_and_cursor(tmp_path):
+    handler, manager, store = await _make_real_handler(tmp_path)
+    session_id = "test:group:summary-retry-cooldown"
+    handler.config_manager._config["reflection_engine"][
+        "summary_trigger_rounds"
+    ] = 1
+    await _seed_messages(
+        manager,
+        session_id,
+        [_day(26, 0, 0), _day(26, 0, 5)],
+    )
+    pending = {
+        "start_index": 0,
+        "end_index": 2,
+        "retry_count": 3,
+        "retry_after": 4_000_000_000,
+    }
+    await manager.update_session_metadata(session_id, "pending_summary", pending)
+
+    try:
+        await handler.handle_all_group_messages(
+            _passive_group_event(session_id, "passive-2")
+        )
+
+        assert not handler._storage_tasks
+        assert await manager.get_session_metadata(
+            session_id, "last_summarized_index", 0
+        ) == 0
+        assert await manager.get_session_metadata(
+            session_id, "pending_summary", None
+        ) == pending
+        assert await manager.store.get_message_count(session_id) == 3
     finally:
         await handler.shutdown()
         await store.close()

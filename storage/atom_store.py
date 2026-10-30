@@ -20,6 +20,7 @@ from ..core.models.memory_atom import (
     compute_ttl,
 )
 from ..core.utils.json_utils import safe_json_dict
+from .sqlite_config import SQLITE_BUSY_TIMEOUT_MS, SQLITE_CONNECTION_TIMEOUT_SECONDS
 
 
 class AtomStore:
@@ -32,10 +33,12 @@ class AtomStore:
 
     @asynccontextmanager
     async def _connect(self):
-        db = await aiosqlite.connect(self.db_path)
+        db = await aiosqlite.connect(
+            self.db_path, timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS
+        )
         try:
             await db.execute("PRAGMA journal_mode = WAL")
-            await db.execute("PRAGMA busy_timeout = 10000")
+            await db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
             yield db
         finally:
             await db.close()

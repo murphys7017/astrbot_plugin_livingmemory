@@ -42,6 +42,16 @@ class MemoryEngineWriteOpsMixin:
     _search_cache_max_size: int
     _search_cache_generation: int
     _search_cache: OrderedDict[tuple[Any, ...], tuple[float, list[HybridResult]]]
+    _prompt_recall_ttl: float
+    _prompt_recall_cache: OrderedDict[
+        tuple[str, str], tuple[float, list[HybridResult]]
+    ]
+    _pending_prompt_refreshes: dict[
+        tuple[str, str], tuple[tuple[Any, ...], asyncio.Task]
+    ]
+    _queued_prompt_refreshes: dict[
+        tuple[str, str], tuple[tuple[Any, ...], str, int, str, str | None]
+    ]
 
     def _normalize_cache_query(self, query: str) -> str:
         return " ".join(query.casefold().split())
@@ -246,10 +256,158 @@ class MemoryEngineWriteOpsMixin:
         while len(self._search_cache) > self._search_cache_max_size:
             self._search_cache.popitem(last=False)
 
+    def _get_prompt_recall_snapshot(
+        self,
+        session_id: str | None,
+        persona_id: str | None,
+    ) -> list[HybridResult] | None:
+        if (
+            not session_id
+            or not self._search_cache_enabled
+            or self._search_cache_ttl <= 0
+            or self._search_cache_max_size <= 0
+            or self._prompt_recall_ttl <= 0
+        ):
+            return None
+
+        scope_key = (session_id, persona_id or "")
+        cached = self._prompt_recall_cache.get(scope_key)
+        if cached is None:
+            return None
+
+        cached_at, results = cached
+        if time.monotonic() - cached_at > self._prompt_recall_ttl:
+            self._prompt_recall_cache.pop(scope_key, None)
+            return None
+
+        self._prompt_recall_cache.move_to_end(scope_key)
+        return copy.deepcopy(results)
+
+    def _remember_prompt_recall_snapshot(
+        self,
+        session_id: str | None,
+        persona_id: str | None,
+        results: list[HybridResult],
+        *,
+        generation: int,
+    ) -> None:
+        if (
+            not session_id
+            or generation != self._search_cache_generation
+            or not self._search_cache_enabled
+            or self._search_cache_ttl <= 0
+            or self._search_cache_max_size <= 0
+            or self._prompt_recall_ttl <= 0
+        ):
+            return
+
+        scope_key = (session_id, persona_id or "")
+        self._prompt_recall_cache[scope_key] = (
+            time.monotonic(),
+            copy.deepcopy(results),
+        )
+        self._prompt_recall_cache.move_to_end(scope_key)
+        while len(self._prompt_recall_cache) > self._search_cache_max_size:
+            self._prompt_recall_cache.popitem(last=False)
+
+    def _schedule_prompt_recall_refresh(
+        self,
+        cache_key: tuple[Any, ...],
+        query: str,
+        k: int,
+        session_id: str | None,
+        persona_id: str | None,
+    ) -> None:
+        if not session_id:
+            return
+
+        scope_key = (session_id, persona_id or "")
+        existing = self._pending_prompt_refreshes.get(scope_key)
+        if existing is not None and not existing[1].done():
+            if existing[0] == cache_key:
+                self._queued_prompt_refreshes.pop(scope_key, None)
+            else:
+                self._queued_prompt_refreshes[scope_key] = (
+                    cache_key,
+                    query,
+                    k,
+                    session_id,
+                    persona_id,
+                )
+            return
+
+        task = self._create_tracked_task(
+            self._refresh_prompt_recall(
+                cache_key,
+                query,
+                k,
+                session_id,
+                persona_id,
+                scope_key,
+            )
+        )
+        self._pending_prompt_refreshes[scope_key] = (cache_key, task)
+
+    async def _refresh_prompt_recall(
+        self,
+        cache_key: tuple[Any, ...],
+        query: str,
+        k: int,
+        session_id: str,
+        persona_id: str | None,
+        scope_key: tuple[str, str],
+    ) -> None:
+        request = (cache_key, query, k, session_id, persona_id)
+        try:
+            while True:
+                cache_key, query, k, session_id, persona_id = request
+                current = asyncio.current_task()
+                pending = self._pending_prompt_refreshes.get(scope_key)
+                if current is not None and pending is not None and pending[1] is current:
+                    self._pending_prompt_refreshes[scope_key] = (cache_key, current)
+
+                results = None
+                try:
+                    results = await self.search_memories(
+                        query=query,
+                        k=k,
+                        session_id=session_id,
+                        persona_id=persona_id,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        f"后台刷新提示词记忆召回失败: "
+                        f"session_id={session_id} error={exc}",
+                        exc_info=True,
+                    )
+
+                queued = self._queued_prompt_refreshes.pop(scope_key, None)
+                if queued is not None:
+                    request = queued
+                    continue
+
+                if results is not None:
+                    self._remember_prompt_recall_snapshot(
+                        session_id,
+                        persona_id,
+                        results,
+                        generation=cache_key[0],
+                    )
+                return
+        finally:
+            current = asyncio.current_task()
+            pending = self._pending_prompt_refreshes.get(scope_key)
+            if pending is not None and pending[1] is current:
+                self._pending_prompt_refreshes.pop(scope_key, None)
+                self._queued_prompt_refreshes.pop(scope_key, None)
+
     def _invalidate_search_cache(self) -> None:
         """Invalidate cached retrieval results after memory writes."""
         self._search_cache_generation += 1
         self._search_cache.clear()
+        self._prompt_recall_cache.clear()
 
     async def _delete_document_indexes_for_batch(self, memory_ids: list[int]) -> int:
         if not memory_ids or self.db_connection is None:

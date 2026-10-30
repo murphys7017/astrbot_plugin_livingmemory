@@ -5,6 +5,7 @@
 
 import asyncio
 import math
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -194,6 +195,39 @@ class MemoryReflection:
         except Exception as e:
             logger.error(f"处理记忆反思时发生错误: {e}", exc_info=True)
 
+    async def handle_group_capture(self, event: AstrMessageEvent) -> None:
+        """Schedule summaries from passive group capture, even without a bot reply."""
+        if not self.config_manager.get(
+            "session_manager.enable_full_group_capture", True
+        ):
+            return
+        if event.get_message_type() != MessageType.GROUP_MESSAGE:
+            return
+        if event.get_sender_id() == event.get_self_id():
+            return
+        if not is_event_memory_allowed(self.config_manager, event):
+            return
+
+        session_id = event.unified_msg_origin
+        if not session_id or self._shutting_down:
+            return
+
+        async with self._storage_state_lock:
+            if session_id in self._storage_sessions_inflight:
+                return
+
+        try:
+            plan = await self._reflection_plan_for_current_history(event, session_id)
+            if plan is not None:
+                await self._schedule_reflection(plan)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.error(
+                f"[{session_id}] 从群聊捕获触发记忆总结失败: {exc}",
+                exc_info=True,
+            )
+
     async def _reflection_precheck(
         self, event: AstrMessageEvent, resp: LLMResponse
     ) -> tuple[str, str] | None:
@@ -249,9 +283,7 @@ class MemoryReflection:
         ]
         response_lower = response_text.lower()
         if any(indicator in response_lower for indicator in error_indicators):
-            logger.debug(
-                f"[{session_id}] 检测到错误响应，跳过记录: {response_text[:50]}..."
-            )
+            logger.debug(f"[{session_id}] 检测到错误响应，跳过记录")
             return None
 
         if await self._is_superseded_response(event, session_id):
@@ -321,6 +353,13 @@ class MemoryReflection:
         if not is_group:
             await self.message_utils.enforce_message_limit(session_id)
 
+        return await self._reflection_plan_for_current_history(event, session_id)
+
+    async def _reflection_plan_for_current_history(
+        self, event: AstrMessageEvent, session_id: str
+    ) -> _ReflectionPlan | None:
+        """Check the stored conversation and build a summary plan if due."""
+
         session_info = await self.conversation_manager.get_session_info(session_id)
         if not session_info:
             logger.warning(
@@ -365,7 +404,17 @@ class MemoryReflection:
                 session_id, "last_summarized_index", total_messages
             )
 
-        unsummarized_rounds = (total_messages - last_summarized_index) // 2
+        if event.get_message_type() == MessageType.GROUP_MESSAGE:
+            unsummarized_rounds = (
+                await self.conversation_manager.store.get_message_count_by_role(
+                    session_id,
+                    role="user",
+                    start_index=last_summarized_index,
+                    end_index=total_messages,
+                )
+            )
+        else:
+            unsummarized_rounds = (total_messages - last_summarized_index) // 2
         pending_summary = await self.conversation_manager.get_session_metadata(
             session_id, "pending_summary", None
         )
@@ -376,14 +425,13 @@ class MemoryReflection:
             f"触发阈值: {trigger_rounds}轮, "
             f"待处理失败总结: {pending_summary is not None}"
         )
-        if unsummarized_rounds < trigger_rounds:
+        if unsummarized_rounds < trigger_rounds and pending_summary is None:
             return None
 
         logger.info(
             f"[{session_id}] 未总结轮数达到 {unsummarized_rounds} 轮，启动记忆反思任务"
         )
-        self._schedule_consolidation()
-        return await self._build_reflection_window(
+        plan = await self._build_reflection_window(
             event,
             session_id,
             total_messages,
@@ -391,6 +439,9 @@ class MemoryReflection:
             pending_summary,
             expected_revision,
         )
+        if plan is not None:
+            self._schedule_consolidation()
+        return plan
 
     async def _build_reflection_window(
         self,
@@ -433,17 +484,19 @@ class MemoryReflection:
             pending_start = pending_summary.get("start_index", start_index)
             retry_count = pending_summary.get("retry_count", 0)
             if retry_count >= 3:
-                logger.warning(
-                    f"[{session_id}] 待处理总结已连续失败 {retry_count} 次，放弃该范围 "
+                retry_after = pending_summary.get("retry_after", 0)
+                if isinstance(retry_after, (int, float)) and time.time() < retry_after:
+                    logger.warning(
+                        f"[{session_id}] 总结范围 [{pending_start}:"
+                        f"{pending_summary.get('end_index', end_index)}] 已连续失败 "
+                        f"{retry_count} 次，保留未总结消息并等待冷却后重试"
+                    )
+                    return None
+                logger.info(
+                    f"[{session_id}] 总结冷却结束，重试保留范围 "
                     f"[{pending_start}:{pending_summary.get('end_index', end_index)}]"
                 )
-                await self.conversation_manager.update_session_metadata(
-                    session_id, "pending_summary", None
-                )
-                await self.conversation_manager.update_session_metadata(
-                    session_id, "last_summarized_index", end_index
-                )
-                return None
+                retry_count = 0
             start_index = pending_start
             logger.info(
                 f"[{session_id}] 合并待处理失败总结，新范围 [{start_index}:{end_index}], "
@@ -1062,6 +1115,8 @@ class MemoryReflection:
             "end_index": end_index,
             "retry_count": new_retry_count,
         }
+        if new_retry_count >= 3:
+            pending_summary["retry_after"] = time.time() + 300
 
         committed = await self._commit_session_metadata(
             session_id, "pending_summary", pending_summary, expected_revision

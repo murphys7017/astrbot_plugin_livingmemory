@@ -257,7 +257,7 @@ class MemoryRecall:
 
                 # 执行记忆召回
                 logger.info(
-                    f"[{session_id}] 开始记忆召回，查询='{query_for_search[:80]}...'"
+                    f"[{session_id}] 开始记忆召回，查询长度={len(query_for_search)}字符"
                 )
 
                 recalled_memories = await self.memory_engine.search_memories(
@@ -265,6 +265,7 @@ class MemoryRecall:
                     k=self.config_manager.get("recall_engine.top_k", 5),
                     session_id=recall_session_id,
                     persona_id=recall_persona_id,
+                    allow_stale_while_refresh=True,
                 )
 
                 if recalled_memories:
@@ -288,8 +289,7 @@ class MemoryRecall:
                     for i, mem in enumerate(recalled_memories, 1):
                         logger.debug(
                             f"[{session_id}] 记忆 #{i}: 得分={mem.final_score:.3f}, "
-                            f"重要性={mem.metadata.get('importance', 0.5):.2f}, "
-                            f"内容={mem.content[:100]}..."
+                            f"重要性={mem.metadata.get('importance', 0.5):.2f}"
                         )
 
                     # 注入策略适配层负责把历史配置值映射到唯一的 add-only

@@ -22,6 +22,10 @@ from ...storage.schema import (
     DOCUMENTS_INDEX_STATEMENTS,
     MIGRATION_STATUS_SCHEMA_STATEMENTS,
 )
+from ...storage.sqlite_config import (
+    SQLITE_BUSY_TIMEOUT_MS,
+    SQLITE_CONNECTION_TIMEOUT_SECONDS,
+)
 from ..managers.atom_lifecycle_manager import AtomLifecycleManager
 from ..managers.graph_memory_manager import GraphMemoryManager
 from ..processors.graph_extractor import GraphExtractor
@@ -36,8 +40,8 @@ from ..retrieval.hybrid_retriever import HybridResult, HybridRetriever
 from ..retrieval.memory_index_writer import MemoryIndexWriter
 from ..retrieval.rrf_fusion import RRFFusion
 from ..retrieval.vector_retriever import VectorRetriever
-from .memory_engine_batch import MemoryEngineBatchMixin
 from .memory_engine_agentic import MemoryEngineAgenticMixin
+from .memory_engine_batch import MemoryEngineBatchMixin
 from .memory_engine_crud import MemoryEngineCrudMixin
 from .memory_engine_write_ops import MemoryEngineWriteOpsMixin
 
@@ -163,6 +167,18 @@ class MemoryEngine(
         self._search_cache: OrderedDict[
             tuple[Any, ...], tuple[float, list[HybridResult]]
         ] = OrderedDict()
+        self._prompt_recall_ttl = float(
+            self.config.get("prompt_stale_recall_ttl_seconds", 300.0)
+        )
+        self._prompt_recall_cache: OrderedDict[
+            tuple[str, str], tuple[float, list[HybridResult]]
+        ] = OrderedDict()
+        self._pending_prompt_refreshes: dict[
+            tuple[str, str], tuple[tuple[Any, ...], asyncio.Task]
+        ] = {}
+        self._queued_prompt_refreshes: dict[
+            tuple[str, str], tuple[tuple[Any, ...], str, int, str, str | None]
+        ] = {}
         # 访问统计合并写：同一时间窗口内多次召回只落一次库
         self._access_update_pending: set[int] = set()
         self._access_atom_update_pending: set[int] = set()
@@ -181,10 +197,14 @@ class MemoryEngine(
         创建数据库表、初始化所有检索器组件
         """
         # 1. 连接数据库
-        self.db_connection = await aiosqlite.connect(self.db_path)
+        self.db_connection = await aiosqlite.connect(
+            self.db_path, timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS
+        )
         self.db_connection.row_factory = aiosqlite.Row
         await self.db_connection.execute("PRAGMA journal_mode = WAL")
-        await self.db_connection.execute("PRAGMA busy_timeout = 10000")
+        await self.db_connection.execute(
+            f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}"
+        )
 
         # 2. 创建表结构
         await self._create_tables()

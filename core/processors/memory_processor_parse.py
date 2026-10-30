@@ -30,9 +30,6 @@ class MemoryProcessorParseMixin:
             # 尝试直接解析JSON
             # 先清理可能的markdown代码块标记
             cleaned_text = response_text.strip()
-            logger.debug(
-                f"[MemoryProcessor] 清理前的响应文本（前100字符）: {response_text[:100]}"
-            )
 
             if cleaned_text.startswith("```json"):
                 cleaned_text = cleaned_text[7:]
@@ -46,7 +43,7 @@ class MemoryProcessorParseMixin:
             cleaned_text = cleaned_text.strip()
 
             logger.debug(
-                f"[MemoryProcessor] 清理后准备解析的 JSON（前500字符）:\n{cleaned_text[:500]}"
+                f"[MemoryProcessor] 清理后准备解析 JSON，长度={len(cleaned_text)}"
             )
 
             # 解析JSON
@@ -82,7 +79,9 @@ class MemoryProcessorParseMixin:
 
             # 数据类型校验和规范化
             data["summary"] = str(data.get("summary", ""))
-            logger.debug(f"[MemoryProcessor] 提取 summary: {data['summary'][:100]}...")
+            logger.debug(
+                f"[MemoryProcessor] 提取 summary，长度={len(data['summary'])}"
+            )
 
             data["canonical_summary"] = str(
                 data.get("canonical_summary") or ""
@@ -90,12 +89,12 @@ class MemoryProcessorParseMixin:
 
             data["topics"] = self._ensure_list(data.get("topics", []))[:5]
             logger.debug(
-                f"[MemoryProcessor] 提取 topics ({len(data['topics'])} 个): {data['topics']}"
+                f"[MemoryProcessor] 提取 topics ({len(data['topics'])} 个)"
             )
 
             data["key_facts"] = self._ensure_list(data.get("key_facts", []))[:5]
             logger.debug(
-                f"[MemoryProcessor] 提取 key_facts ({len(data['key_facts'])} 个): {data['key_facts']}"
+                f"[MemoryProcessor] 提取 key_facts ({len(data['key_facts'])} 个)"
             )
 
             data["sentiment"] = self._validate_sentiment(
@@ -109,16 +108,13 @@ class MemoryProcessorParseMixin:
             if is_group_chat:
                 data["participants"] = self._ensure_list(data.get("participants", []))
                 logger.debug(
-                    f"[MemoryProcessor] 提取 participants ({len(data['participants'])} 个): {data['participants']}"
+                    f"[MemoryProcessor] 提取 participants ({len(data['participants'])} 个)"
                 )
 
             return data
 
         except (json.JSONDecodeError, ValueError) as e:
             logger.warning(f"[MemoryProcessor]  JSON 解析失败: {e}")
-            logger.debug(
-                f"[MemoryProcessor] 解析失败的内容（前200字符）: {response_text[:200]}"
-            )
 
             # 尝试修复 JSON 后再解析
             logger.info("[MemoryProcessor] 尝试修复 JSON 后重新解析")
@@ -139,7 +135,7 @@ class MemoryProcessorParseMixin:
                 f"[MemoryProcessor]  解析 LLM 响应时发生异常: {e}", exc_info=True
             )
             logger.debug(
-                f"[MemoryProcessor] 异常发生时的响应内容: {response_text[:200]}"
+                f"[MemoryProcessor] 异常响应长度={len(response_text)}字符"
             )
             return self._get_default_structured_data(is_group_chat)
 
@@ -167,9 +163,6 @@ class MemoryProcessorParseMixin:
             )
 
             for i, match in enumerate(json_matches):
-                logger.debug(
-                    f"[MemoryProcessor] JSON 块 #{i + 1} (前200字符): {match[:200]}..."
-                )
                 try:
                     # 尝试解析每个匹配的块
                     parsed = json.loads(match)
@@ -191,7 +184,7 @@ class MemoryProcessorParseMixin:
                 if summary_match:
                     data["summary"] = summary_match.group(1)
                     logger.debug(
-                        f"[MemoryProcessor] 正则提取 summary: {data['summary'][:50]}..."
+                        f"[MemoryProcessor] 正则提取 summary，长度={len(data['summary'])}"
                     )
 
                 # 提取importance
@@ -216,7 +209,9 @@ class MemoryProcessorParseMixin:
                     topics_str = topics_match.group(1)
                     topics = re.findall(r'"([^"]+)"', topics_str)
                     data["topics"] = topics[:5]
-                    logger.debug(f"[MemoryProcessor] 正则提取 topics: {data['topics']}")
+                    logger.debug(
+                        f"[MemoryProcessor] 正则提取 topics ({len(data['topics'])} 个)"
+                    )
 
                 # 提取 key_facts 数组
                 facts_match = re.search(r'"key_facts"\s*:\s*\[(.*?)\]', text, re.DOTALL)
@@ -225,7 +220,7 @@ class MemoryProcessorParseMixin:
                     facts = re.findall(r'"([^"]+)"', facts_str)
                     data["key_facts"] = facts[:5]
                     logger.debug(
-                        f"[MemoryProcessor] 正则提取 key_facts: {data['key_facts']}"
+                        f"[MemoryProcessor] 正则提取 key_facts ({len(data['key_facts'])} 个)"
                     )
 
             logger.info(
