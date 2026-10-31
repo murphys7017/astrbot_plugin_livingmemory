@@ -120,7 +120,10 @@ class MemoryEngine(
             rerank_provider_resolver: 返回RerankProvider实例的可调用对象(可选)。
                 动态解析以适配AstrBot的Provider实例重建,传None时跳过重排序。
         """
-        self.db_path = db_path
+        # Keep every SQLite consumer on one canonical absolute path. Relative
+        # paths are fragile for deferred aiosqlite tasks because their worker
+        # thread may observe a different process cwd.
+        self.db_path = str(Path(db_path).expanduser().resolve())
         self.faiss_db = faiss_db
         self.graph_vector_db = graph_vector_db
         self.llm_provider = llm_provider
@@ -135,7 +138,7 @@ class MemoryEngine(
         )
 
         # 确保数据库目录存在
-        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
 
         # 后台任务跟踪
         self._pending_tasks: set[asyncio.Task] = set()

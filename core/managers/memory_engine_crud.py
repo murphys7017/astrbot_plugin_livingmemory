@@ -5,8 +5,11 @@ MemoryEngine 的 MemoryEngineCrudMixin 拆分模块
 
 import asyncio
 import json
+import os
+import sqlite3
 import time
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 import aiosqlite
@@ -37,6 +40,7 @@ class MemoryEngineCrudMixin:
 
     # 访问统计合并窗口：窗口内的多次召回合并为一次 UPDATE
     _ACCESS_UPDATE_DEBOUNCE_SECONDS = 3.0
+    _ACCESS_UPDATE_RETRY_DELAYS_SECONDS = (0.0, 0.2, 0.8)
 
     # 宿主共享状态契约
     db_connection: aiosqlite.Connection | None
@@ -1536,58 +1540,101 @@ class MemoryEngineCrudMixin:
             return False
 
         current_time = time.time()
-        try:
-            # Keep best-effort recall writes off the long-lived engine connection,
-            # so a failed update cannot leave another operation's transaction open.
-            async with aiosqlite.connect(
-                self.db_path, timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS
-            ) as db:
-                await db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
-
-                # Single atomic UPDATE prevents concurrent recalls losing increments.
-                placeholders = ",".join("?" * len(unique_ids))
-                cursor = await db.execute(
-                    f"""
-                    UPDATE documents
-                    SET metadata = CASE
-                        WHEN json_valid(metadata) THEN json_set(
-                            json_set(metadata, '$.last_access_time', ?),
-                            '$.access_count',
-                            MIN(
-                                COALESCE(
-                                    CAST(json_extract(metadata, '$.access_count') AS INTEGER),
-                                    0
-                                ) + 1,
-                                1000000
-                            )
+        db_path = Path(self.db_path).expanduser().resolve()
+        placeholders = ",".join("?" * len(unique_ids))
+        update_sql = f"""
+            UPDATE documents
+            SET metadata = CASE
+                WHEN json_valid(metadata) THEN json_set(
+                    json_set(metadata, '$.last_access_time', ?),
+                    '$.access_count',
+                    MIN(
+                        COALESCE(
+                            CAST(json_extract(metadata, '$.access_count') AS INTEGER),
+                            0
+                        ) + 1,
+                        1000000
+                    )
+                ELSE json_set('{{}}', '$.last_access_time', ?, '$.access_count', 1)
+            END
+            WHERE id IN ({placeholders})
+        """
+        retryable_codes = {
+            getattr(sqlite3, "SQLITE_BUSY", 5),
+            getattr(sqlite3, "SQLITE_LOCKED", 6),
+            getattr(sqlite3, "SQLITE_CANTOPEN", 14),
+        }
+        last_error: Exception | None = None
+        for attempt, delay in enumerate(self._ACCESS_UPDATE_RETRY_DELAYS_SECONDS):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                # Keep best-effort recall writes off the long-lived engine
+                # connection, but tolerate short Windows file/sidecar races.
+                async with aiosqlite.connect(
+                    str(db_path), timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS
+                ) as db:
+                    await db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+                    cursor = await db.execute(
+                        update_sql,
+                        (current_time, current_time, *unique_ids),
+                    )
+                    if atom_ids and self.atom_store is not None:
+                        unique_atoms = list(
+                            dict.fromkeys(int(atom_id) for atom_id in atom_ids)
                         )
-                        ELSE json_set('{{}}', '$.last_access_time', ?, '$.access_count', 1)
-                    END
-                    WHERE id IN ({placeholders})
-                    """,
-                    (current_time, current_time, *unique_ids),
+                        await db.execute(
+                            f"UPDATE memory_atoms SET last_accessed_at = ? "
+                            f"WHERE id IN ({','.join('?' for _ in unique_atoms)}) "
+                            "AND status = 'active' AND expires_at > ?",
+                            (current_time, *unique_atoms, current_time),
+                        )
+                    await db.commit()
+                return cursor.rowcount > 0
+            except asyncio.CancelledError:
+                raise
+            except sqlite3.OperationalError as exc:
+                last_error = exc
+                if (
+                    getattr(exc, "sqlite_errorcode", None) not in retryable_codes
+                    or attempt == len(self._ACCESS_UPDATE_RETRY_DELAYS_SECONDS) - 1
+                ):
+                    break
+                logger.debug(
+                    "SQLite access update retrying: attempt=%s/%s code=%s name=%s path=%s",
+                    attempt + 1,
+                    len(self._ACCESS_UPDATE_RETRY_DELAYS_SECONDS),
+                    getattr(exc, "sqlite_errorcode", None),
+                    getattr(exc, "sqlite_errorname", None),
+                    db_path,
                 )
-                if atom_ids and self.atom_store is not None:
-                    unique_atoms = list(
-                        dict.fromkeys(int(atom_id) for atom_id in atom_ids)
-                    )
-                    await db.execute(
-                        f"UPDATE memory_atoms SET last_accessed_at = ? "
-                        f"WHERE id IN ({','.join('?' for _ in unique_atoms)}) "
-                        "AND status = 'active' AND expires_at > ?",
-                        (current_time, *unique_atoms, current_time),
-                    )
-                await db.commit()
-            return cursor.rowcount > 0
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            # 记录错误但不影响查询流程
-            logger.warning(
-                f"批量更新访问时间失败 (doc_ids={unique_ids}): {e}",
-                exc_info=True,
-            )
-            return False
+            except Exception as exc:  # noqa: BLE001
+                last_error = exc
+                break
+
+        # Access statistics are best-effort, but diagnostics must distinguish a
+        # transient lock from a missing path or an unwritable WAL/SHM parent.
+        parent = db_path.parent
+        sidecars = ",".join(
+            f"{suffix or 'db'}={'1' if Path(str(db_path) + suffix).exists() else '0'}"
+            for suffix in ("", "-wal", "-shm")
+        )
+        logger.warning(
+            "批量更新访问时间失败 (doc_ids=%s): %s; "
+            "path=%s parent_exists=%s parent_writable=%s db_exists=%s sidecars=%s "
+            "sqlite_code=%s sqlite_name=%s",
+            unique_ids,
+            last_error,
+            db_path,
+            parent.exists(),
+            os.access(parent, os.W_OK),
+            db_path.exists(),
+            sidecars,
+            getattr(last_error, "sqlite_errorcode", None),
+            getattr(last_error, "sqlite_errorname", None),
+            exc_info=True,
+        )
+        return False
 
     async def get_session_memories(
         self,

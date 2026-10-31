@@ -3,22 +3,24 @@ PluginInitializer 的 InitializerFinalizeMixin 拆分模块
 自动从 core/plugin_initializer.py 拆分，保持行为不变
 """
 
-from typing import Any
 import asyncio
-from .managers.conversation_manager import ConversationManager
+import time
+from pathlib import Path
+from typing import Any
+
+from astrbot.api import logger
+from astrbot.core.provider.provider import Provider
+
 from ..storage.conversation_store import ConversationStore
 from ..storage.db_migration import DBMigration
-from .schedulers.decay_scheduler import DecayScheduler
-from .validators.index_validator import IndexValidator
 from .base.exceptions import InitializationError, ProviderNotReadyError
-from astrbot.api import logger
 from .faiss_async_persist import install_async_persist
 from .managers.consolidation_manager import MemoryConsolidationManager
+from .managers.conversation_manager import ConversationManager
 from .managers.memory_engine import MemoryEngine
 from .processors.memory_processor import MemoryProcessor
-from pathlib import Path
-from astrbot.core.provider.provider import Provider
-import time
+from .schedulers.decay_scheduler import DecayScheduler
+from .validators.index_validator import IndexValidator
 
 
 class InitializerFinalizeMixin:
@@ -32,7 +34,8 @@ class InitializerFinalizeMixin:
 
         try:
             # 初始化数据库
-            data_dir_path = Path(self.data_dir)
+            data_dir_path = Path(self.data_dir).expanduser().resolve()
+            self.data_dir = str(data_dir_path)
             db_path = data_dir_path / "livingmemory.db"
             index_path = data_dir_path / "livingmemory.index"
             graph_doc_path = data_dir_path / "livingmemory_graph_documents.db"
