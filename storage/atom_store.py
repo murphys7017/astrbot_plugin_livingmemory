@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import sqlite3
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import aiosqlite
@@ -27,9 +31,11 @@ class AtomStore:
     """Persist memory atoms with FTS search support."""
 
     _SQLITE_BATCH_SIZE = 500
+    _SQLITE_RETRY_DELAYS_SECONDS = (0.0, 0.2, 0.8)
 
     def __init__(self, db_path: str):
-        self.db_path = db_path
+        self.db_path = str(Path(db_path).expanduser().resolve())
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
 
     @asynccontextmanager
     async def _connect(self):
@@ -37,7 +43,6 @@ class AtomStore:
             self.db_path, timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS
         )
         try:
-            await db.execute("PRAGMA journal_mode = WAL")
             await db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
             yield db
         finally:
@@ -56,6 +61,10 @@ class AtomStore:
     async def initialize(self) -> None:
         """Create tables for memory atoms."""
         async with self._connect() as db:
+            # Set WAL once during initialization. Repeating this write-like
+            # PRAGMA on every short-lived connection creates avoidable sidecar
+            # races with the engine and graph stores.
+            await db.execute("PRAGMA journal_mode = WAL")
             await db.execute("PRAGMA foreign_keys = ON")
             await db.execute(
                 """
@@ -430,13 +439,63 @@ class AtomStore:
     async def expire_stale_atoms(self) -> int:
         """Mark atoms whose expires_at has passed as EXPIRED. Returns count."""
         now = time.time()
-        async with self._connect() as db:
-            cursor = await db.execute(
-                "UPDATE memory_atoms SET status = ? WHERE status = 'active' AND expires_at < ?",
-                (AtomStatus.EXPIRED.value, now),
-            )
-            await db.commit()
-            return cursor.rowcount
+        retryable_codes = {
+            getattr(sqlite3, "SQLITE_BUSY", 5),
+            getattr(sqlite3, "SQLITE_LOCKED", 6),
+            getattr(sqlite3, "SQLITE_CANTOPEN", 14),
+        }
+        last_error: sqlite3.OperationalError | None = None
+        for attempt, delay in enumerate(self._SQLITE_RETRY_DELAYS_SECONDS):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                async with self._connect() as db:
+                    cursor = await db.execute(
+                        "UPDATE memory_atoms SET status = ? "
+                        "WHERE status = 'active' AND expires_at < ?",
+                        (AtomStatus.EXPIRED.value, now),
+                    )
+                    await db.commit()
+                    return cursor.rowcount
+            except asyncio.CancelledError:
+                raise
+            except sqlite3.OperationalError as exc:
+                last_error = exc
+                if (
+                    getattr(exc, "sqlite_errorcode", None) not in retryable_codes
+                    or attempt == len(self._SQLITE_RETRY_DELAYS_SECONDS) - 1
+                ):
+                    break
+                logger.debug(
+                    "[AtomStore] SQLite maintenance retrying: attempt=%s/%s "
+                    "code=%s name=%s path=%s",
+                    attempt + 1,
+                    len(self._SQLITE_RETRY_DELAYS_SECONDS),
+                    getattr(exc, "sqlite_errorcode", None),
+                    getattr(exc, "sqlite_errorname", None),
+                    self.db_path,
+                )
+
+        assert last_error is not None
+        db_path = Path(self.db_path)
+        logger.error(
+            "[AtomStore] 过期原子维护失败: %s; path=%s parent_exists=%s "
+            "parent_writable=%s db_exists=%s sidecars=db=%s,-wal=%s,-shm=%s "
+            "sqlite_code=%s sqlite_name=%s",
+            last_error,
+            db_path,
+            db_path.parent.exists(),
+            db_path.parent.exists() and os.access(db_path.parent, os.W_OK),
+            db_path.exists(),
+            *(
+                int(Path(f"{db_path}{suffix}").exists())
+                for suffix in ("", "-wal", "-shm")
+            ),
+            getattr(last_error, "sqlite_errorcode", None),
+            getattr(last_error, "sqlite_errorname", None),
+            exc_info=True,
+        )
+        raise last_error
 
     async def cleanup_forgotten(self, older_than_days: float = 7.0) -> int:
         """Remove FORGOTTEN atoms older than the threshold from FTS. Returns count."""

@@ -1555,6 +1555,7 @@ class MemoryEngineCrudMixin:
                         ) + 1,
                         1000000
                     )
+                )
                 ELSE json_set('{{}}', '$.last_access_time', ?, '$.access_count', 1)
             END
             WHERE id IN ({placeholders})
