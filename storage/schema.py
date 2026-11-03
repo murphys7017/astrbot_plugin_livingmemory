@@ -132,42 +132,73 @@ MIGRATION_STATUS_SCHEMA_STATEMENTS: tuple[str, ...] = (
     """,
 )
 
-# Expression indexes must match the filter/order expressions used by recall and
-# the dashboard literally (including COALESCE/CAST wrappers) to be usable.
-# These only rely on the metadata column, so migrations can apply them to legacy
-# documents tables before the engine adds its compatibility columns.
+DOCUMENTS_STABLE_COLUMN_DEFINITIONS: tuple[tuple[str, str], ...] = (
+    ("lmem_session_id", "TEXT"),
+    ("lmem_persona_id", "TEXT"),
+    ("lmem_importance_scaled", "INTEGER NOT NULL DEFAULT 0"),
+    ("lmem_last_access_epoch", "INTEGER NOT NULL DEFAULT 0"),
+    ("lmem_create_epoch", "INTEGER NOT NULL DEFAULT 0"),
+    ("lmem_updated_epoch", "INTEGER NOT NULL DEFAULT 0"),
+    ("lmem_status", "TEXT NOT NULL DEFAULT 'active'"),
+    ("lmem_memory_type", "TEXT NOT NULL DEFAULT 'GENERAL'"),
+)
+
+DOCUMENTS_STABLE_SYNC_TRIGGER_STATEMENTS: tuple[str, ...] = (
+    """
+    CREATE TRIGGER IF NOT EXISTS lmem_documents_sync_stable_after_insert
+    AFTER INSERT ON documents
+    BEGIN
+        UPDATE documents
+        SET lmem_session_id = CASE WHEN json_valid(NEW.metadata) THEN json_extract(NEW.metadata, '$.session_id') END,
+            lmem_persona_id = CASE WHEN json_valid(NEW.metadata) THEN json_extract(NEW.metadata, '$.persona_id') END,
+            lmem_importance_scaled = CASE WHEN json_valid(NEW.metadata) THEN CAST(ROUND(COALESCE(CAST(json_extract(NEW.metadata, '$.importance') AS REAL), 0) * 10000) AS INTEGER) ELSE 0 END,
+            lmem_last_access_epoch = CASE WHEN json_valid(NEW.metadata) THEN CAST(COALESCE(CAST(json_extract(NEW.metadata, '$.last_access_time') AS REAL), 0) AS INTEGER) ELSE 0 END,
+            lmem_create_epoch = CASE WHEN json_valid(NEW.metadata) THEN CAST(COALESCE(CAST(json_extract(NEW.metadata, '$.create_time') AS REAL), 0) AS INTEGER) ELSE 0 END,
+            lmem_updated_epoch = CASE WHEN json_valid(NEW.metadata) THEN CAST(COALESCE(CAST(json_extract(NEW.metadata, '$.updated_at') AS REAL), 0) AS INTEGER) ELSE 0 END,
+            lmem_status = CASE WHEN json_valid(NEW.metadata) THEN COALESCE(json_extract(NEW.metadata, '$.status'), 'active') ELSE 'active' END,
+            lmem_memory_type = CASE WHEN json_valid(NEW.metadata) THEN UPPER(COALESCE(json_extract(NEW.metadata, '$.memory_type'), 'GENERAL')) ELSE 'GENERAL' END
+        WHERE id = NEW.id;
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS lmem_documents_sync_stable_after_metadata_update
+    AFTER UPDATE OF metadata ON documents
+    BEGIN
+        UPDATE documents
+        SET lmem_session_id = CASE WHEN json_valid(NEW.metadata) THEN json_extract(NEW.metadata, '$.session_id') END,
+            lmem_persona_id = CASE WHEN json_valid(NEW.metadata) THEN json_extract(NEW.metadata, '$.persona_id') END,
+            lmem_importance_scaled = CASE WHEN json_valid(NEW.metadata) THEN CAST(ROUND(COALESCE(CAST(json_extract(NEW.metadata, '$.importance') AS REAL), 0) * 10000) AS INTEGER) ELSE 0 END,
+            lmem_last_access_epoch = CASE WHEN json_valid(NEW.metadata) THEN CAST(COALESCE(CAST(json_extract(NEW.metadata, '$.last_access_time') AS REAL), 0) AS INTEGER) ELSE 0 END,
+            lmem_create_epoch = CASE WHEN json_valid(NEW.metadata) THEN CAST(COALESCE(CAST(json_extract(NEW.metadata, '$.create_time') AS REAL), 0) AS INTEGER) ELSE 0 END,
+            lmem_updated_epoch = CASE WHEN json_valid(NEW.metadata) THEN CAST(COALESCE(CAST(json_extract(NEW.metadata, '$.updated_at') AS REAL), 0) AS INTEGER) ELSE 0 END,
+            lmem_status = CASE WHEN json_valid(NEW.metadata) THEN COALESCE(json_extract(NEW.metadata, '$.status'), 'active') ELSE 'active' END,
+            lmem_memory_type = CASE WHEN json_valid(NEW.metadata) THEN UPPER(COALESCE(json_extract(NEW.metadata, '$.memory_type'), 'GENERAL')) ELSE 'GENERAL' END
+        WHERE id = NEW.id;
+    END
+    """,
+)
+
+# Normal B-tree indexes over stable materialized columns. The previous JSON
+# expression indexes were sensitive to SQLite JSON floating-point formatting
+# changes between runtime versions.
 DOCUMENTS_INDEX_STATEMENTS: tuple[str, ...] = (
-    """
-    CREATE INDEX IF NOT EXISTS idx_doc_metadata
-    ON documents(json_extract(metadata, '$.session_id'))
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_doc_persona_metadata
-    ON documents(json_extract(metadata, '$.persona_id'))
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_doc_importance_metadata
-    ON documents(json_extract(metadata, '$.importance'))
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_doc_last_access_metadata
-    ON documents(json_extract(metadata, '$.last_access_time'))
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_doc_status
-    ON documents(COALESCE(json_extract(metadata, '$.status'), 'active'))
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_doc_memory_type
-    ON documents(UPPER(COALESCE(json_extract(metadata, '$.memory_type'), 'GENERAL')))
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_doc_create_time
-    ON documents(
-        COALESCE(CAST(json_extract(metadata, '$.create_time') AS REAL), 0) DESC,
-        id DESC
-    )
-    """,
+    "CREATE INDEX IF NOT EXISTS idx_doc_metadata ON documents(lmem_session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_doc_persona_metadata ON documents(lmem_persona_id)",
+    "CREATE INDEX IF NOT EXISTS idx_doc_importance_metadata ON documents(lmem_importance_scaled)",
+    "CREATE INDEX IF NOT EXISTS idx_doc_last_access_metadata ON documents(lmem_last_access_epoch)",
+    "CREATE INDEX IF NOT EXISTS idx_doc_status ON documents(lmem_status)",
+    "CREATE INDEX IF NOT EXISTS idx_doc_memory_type ON documents(lmem_memory_type)",
+    "CREATE INDEX IF NOT EXISTS idx_doc_create_time ON documents(lmem_create_epoch DESC, id DESC)",
+)
+
+DOCUMENTS_REINDEX_NAMES: tuple[str, ...] = (
+    "idx_doc_create_time",
+    "idx_doc_last_access_metadata",
+    "idx_doc_importance_metadata",
+    "idx_doc_metadata",
+    "idx_doc_persona_metadata",
+    "idx_doc_status",
+    "idx_doc_memory_type",
 )
 
 # Requires the doc_id compatibility column, which the engine adds before

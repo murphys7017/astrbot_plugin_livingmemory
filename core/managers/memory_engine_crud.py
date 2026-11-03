@@ -17,10 +17,6 @@ import aiosqlite
 from astrbot.api import logger
 
 from ...storage.atom_store import AtomStore
-from ...storage.sqlite_config import (
-    SQLITE_BUSY_TIMEOUT_MS,
-    SQLITE_CONNECTION_TIMEOUT_SECONDS,
-)
 from ..memory_transfer import memory_import_key
 from ..processors.atom_classifier import classify_atoms
 from ..retrieval.hybrid_retriever import HybridResult
@@ -749,7 +745,6 @@ class MemoryEngineCrudMixin:
                 params.extend([keyword_like, keyword_like])
 
         where_clause = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
-        # 与 idx_doc_create_time 首列逐字匹配，created_desc/asc 可走索引排序
         created_expr = (
             "COALESCE(CAST(json_extract(metadata, '$.create_time') AS REAL), 0)"
         )
@@ -1338,9 +1333,7 @@ class MemoryEngineCrudMixin:
                     SELECT id, text, metadata
                     FROM documents
                     WHERE id > ?
-                      AND COALESCE(
-                          json_extract(metadata, '$.status'), 'active'
-                      ) = 'active'
+                      AND lmem_status = 'active'
                     ORDER BY id
                     LIMIT ?
                     """,
@@ -1570,12 +1563,12 @@ class MemoryEngineCrudMixin:
             if delay:
                 await asyncio.sleep(delay)
             try:
-                # Keep best-effort recall writes off the long-lived engine
-                # connection, but tolerate short Windows file/sidecar races.
-                async with aiosqlite.connect(
-                    str(db_path), timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS
-                ) as db:
-                    await db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+                # Serialize access writes with the engine's primary connection.
+                # A second short-lived connection can observe stale WAL/SHM
+                # state on Windows while FAISS or AtomStore is writing the same
+                # database, producing CANTOPEN/CORRUPT_INDEX on an otherwise
+                # healthy file.
+                async with self._write_transaction() as db:
                     cursor = await db.execute(
                         update_sql,
                         (current_time, current_time, *unique_ids),
@@ -1590,7 +1583,6 @@ class MemoryEngineCrudMixin:
                             "AND status = 'active' AND expires_at > ?",
                             (current_time, *unique_atoms, current_time),
                         )
-                    await db.commit()
                 return cursor.rowcount > 0
             except asyncio.CancelledError:
                 raise

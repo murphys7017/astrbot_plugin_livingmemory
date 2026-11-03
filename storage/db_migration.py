@@ -15,6 +15,8 @@ from astrbot.api import logger
 from .schema import (
     DB_VERSION_SCHEMA_STATEMENTS,
     DOCUMENTS_INDEX_STATEMENTS,
+    DOCUMENTS_STABLE_COLUMN_DEFINITIONS,
+    DOCUMENTS_STABLE_SYNC_TRIGGER_STATEMENTS,
     GRAPH_SCHEMA_STATEMENTS,
     MIGRATION_STATUS_SCHEMA_STATEMENTS,
     WRITE_OPS_SCHEMA_STATEMENTS,
@@ -25,7 +27,7 @@ class DBMigration:
     """数据库迁移管理器"""
 
     # 当前数据库版本
-    CURRENT_VERSION = 8
+    CURRENT_VERSION = 10
 
     # 版本历史记录
     VERSION_HISTORY = {
@@ -37,6 +39,8 @@ class DBMigration:
         6: "插件 FTS 表统一 livingmemory 前缀，旧 documents_fts 安全重命名备份",
         7: "Storage indexes and FTS optimization for graph and atom data",
         8: "Write-operation log and access-aware metadata indexes",
+        9: "Stable document columns and SQLite-version-independent indexes",
+        10: "Materialized document columns with metadata synchronization triggers",
     }
 
     def __init__(self, db_path: str):
@@ -258,6 +262,14 @@ class DBMigration:
                 # 从版本7升级到版本8
                 if current_version <= 7:
                     migration_steps.append(self._migrate_v7_to_v8)
+
+                # 从版本8升级到版本9
+                if current_version <= 8:
+                    migration_steps.append(self._migrate_v8_to_v9)
+
+                # 从版本9升级到版本10
+                if current_version <= 9:
+                    migration_steps.append(self._migrate_v9_to_v10)
 
                 # 执行所有迁移步骤
                 for step in migration_steps:
@@ -605,7 +617,7 @@ class DBMigration:
         self,
         progress_callback: Callable[[str, int, int], None] | None,
     ):
-        """Add write-operation log and expression indexes for hot metadata fields."""
+        """Add write-operation log and stable indexes for hot metadata fields."""
         logger.info("执行迁移步骤: v7 -> v8 (write ops and hot metadata indexes)")
 
         try:
@@ -615,7 +627,33 @@ class DBMigration:
                     await db.execute(statement)
 
                 if await self._table_exists(db, "documents"):
+                    existing_columns = {
+                        row[1]
+                        for row in await (
+                            await db.execute("PRAGMA table_xinfo(documents)")
+                        ).fetchall()
+                    }
+                    for column_name, column_definition in (
+                        DOCUMENTS_STABLE_COLUMN_DEFINITIONS
+                    ):
+                        if column_name in existing_columns:
+                            continue
+                        await db.execute(
+                            f"ALTER TABLE documents ADD COLUMN {column_name} {column_definition}"
+                        )
+                    for legacy_index in (
+                        "idx_doc_metadata",
+                        "idx_doc_persona_metadata",
+                        "idx_doc_importance_metadata",
+                        "idx_doc_last_access_metadata",
+                        "idx_doc_status",
+                        "idx_doc_memory_type",
+                        "idx_doc_create_time",
+                    ):
+                        await db.execute(f"DROP INDEX IF EXISTS {legacy_index}")
                     for statement in DOCUMENTS_INDEX_STATEMENTS:
+                        await db.execute(statement)
+                    for statement in DOCUMENTS_STABLE_SYNC_TRIGGER_STATEMENTS:
                         await db.execute(statement)
                     await db.execute(
                         """
@@ -638,6 +676,127 @@ class DBMigration:
 
         except Exception as e:
             logger.error(f"v7 -> v8 迁移失败: {e}", exc_info=True)
+            raise
+
+    async def _migrate_v8_to_v9(
+        self,
+        progress_callback: Callable[[str, int, int], None] | None,
+    ):
+        """Replace JSON expression indexes with stable materialized-column indexes."""
+        logger.info(
+            "执行迁移步骤: v8 -> v9 (stable document columns and indexes)"
+        )
+
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("PRAGMA busy_timeout = 30000")
+                if await self._table_exists(db, "documents"):
+                    existing_columns = {
+                        row[1]
+                        for row in await (
+                            await db.execute("PRAGMA table_xinfo(documents)")
+                        ).fetchall()
+                    }
+                    for column_name, column_definition in (
+                        DOCUMENTS_STABLE_COLUMN_DEFINITIONS
+                    ):
+                        if column_name in existing_columns:
+                            continue
+                        await db.execute(
+                            f"ALTER TABLE documents ADD COLUMN {column_name} {column_definition}"
+                        )
+
+                    for legacy_index in (
+                        "idx_doc_metadata",
+                        "idx_doc_persona_metadata",
+                        "idx_doc_importance_metadata",
+                        "idx_doc_last_access_metadata",
+                        "idx_doc_status",
+                        "idx_doc_memory_type",
+                        "idx_doc_create_time",
+                    ):
+                        await db.execute(f"DROP INDEX IF EXISTS {legacy_index}")
+                    for statement in DOCUMENTS_INDEX_STATEMENTS:
+                        await db.execute(statement)
+                    for statement in DOCUMENTS_STABLE_SYNC_TRIGGER_STATEMENTS:
+                        await db.execute(statement)
+
+                await db.commit()
+            logger.info("v8 -> v9 迁移完成")
+        except Exception as e:
+            logger.error(f"v8 -> v9 迁移失败: {e}", exc_info=True)
+            raise
+
+    async def _migrate_v9_to_v10(
+        self,
+        progress_callback: Callable[[str, int, int], None] | None,
+    ):
+        """Convert generated stable columns to materialized trigger-synced columns."""
+        logger.info(
+            "执行迁移步骤: v9 -> v10 (materialized document columns and sync triggers)"
+        )
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("PRAGMA busy_timeout = 30000")
+                if await self._table_exists(db, "documents"):
+                    for statement in DOCUMENTS_STABLE_SYNC_TRIGGER_STATEMENTS:
+                        trigger_name = statement.split("CREATE TRIGGER IF NOT EXISTS ", 1)[1].split("\n", 1)[0].strip()
+                        await db.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+                    for index_name in (
+                        "idx_doc_metadata",
+                        "idx_doc_persona_metadata",
+                        "idx_doc_importance_metadata",
+                        "idx_doc_last_access_metadata",
+                        "idx_doc_status",
+                        "idx_doc_memory_type",
+                        "idx_doc_create_time",
+                    ):
+                        await db.execute(f"DROP INDEX IF EXISTS {index_name}")
+
+                    columns = {
+                        row[1]: row
+                        for row in await (
+                            await db.execute("PRAGMA table_xinfo(documents)")
+                        ).fetchall()
+                    }
+                    for column_name, _ in DOCUMENTS_STABLE_COLUMN_DEFINITIONS:
+                        existing = columns.get(column_name)
+                        if existing is not None and int(existing[6] or 0) in (2, 3):
+                            await db.execute(f"ALTER TABLE documents DROP COLUMN {column_name}")
+
+                    columns = {
+                        row[1]
+                        for row in await (
+                            await db.execute("PRAGMA table_xinfo(documents)")
+                        ).fetchall()
+                    }
+                    for column_name, column_definition in DOCUMENTS_STABLE_COLUMN_DEFINITIONS:
+                        if column_name not in columns:
+                            await db.execute(
+                                f"ALTER TABLE documents ADD COLUMN {column_name} {column_definition}"
+                            )
+
+                    await db.execute(
+                        """
+                        UPDATE documents
+                        SET lmem_session_id = CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.session_id') END,
+                            lmem_persona_id = CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.persona_id') END,
+                            lmem_importance_scaled = CASE WHEN json_valid(metadata) THEN CAST(ROUND(COALESCE(CAST(json_extract(metadata, '$.importance') AS REAL), 0) * 10000) AS INTEGER) ELSE 0 END,
+                            lmem_last_access_epoch = CASE WHEN json_valid(metadata) THEN CAST(COALESCE(CAST(json_extract(metadata, '$.last_access_time') AS REAL), 0) AS INTEGER) ELSE 0 END,
+                            lmem_create_epoch = CASE WHEN json_valid(metadata) THEN CAST(COALESCE(CAST(json_extract(metadata, '$.create_time') AS REAL), 0) AS INTEGER) ELSE 0 END,
+                            lmem_updated_epoch = CASE WHEN json_valid(metadata) THEN CAST(COALESCE(CAST(json_extract(metadata, '$.updated_at') AS REAL), 0) AS INTEGER) ELSE 0 END,
+                            lmem_status = CASE WHEN json_valid(metadata) THEN COALESCE(json_extract(metadata, '$.status'), 'active') ELSE 'active' END,
+                            lmem_memory_type = CASE WHEN json_valid(metadata) THEN UPPER(COALESCE(json_extract(metadata, '$.memory_type'), 'GENERAL')) ELSE 'GENERAL' END
+                        """
+                    )
+                    for statement in DOCUMENTS_INDEX_STATEMENTS:
+                        await db.execute(statement)
+                    for statement in DOCUMENTS_STABLE_SYNC_TRIGGER_STATEMENTS:
+                        await db.execute(statement)
+                await db.commit()
+            logger.info("v9 -> v10 迁移完成")
+        except Exception as e:
+            logger.error(f"v9 -> v10 迁移失败: {e}", exc_info=True)
             raise
 
     async def _table_exists(self, db: aiosqlite.Connection, table_name: str) -> bool:

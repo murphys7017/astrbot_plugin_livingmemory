@@ -146,7 +146,7 @@ flowchart LR
 
 ## Concurrency model
 
-- A single event loop per process; SQLite uses WAL and `busy_timeout = 10000`, and writes are concentrated on the one `MemoryEngine` connection, which reduces lock contention in a read-heavy workload.
+- A single event loop per process; the LivingMemory database uses the rollback journal with `busy_timeout = 30000` to avoid Windows WAL/SHM sidecar contention across connections, and writes are concentrated on the one `MemoryEngine` connection.
 - FAISS uses a readers-writer lock: searches hold a read lock in the default thread pool, while mutations and flushes hold the write lock; flushes run serially on a single-thread executor with debouncing to preserve write order.
 - The conversation layer has its own session lock and store write lock: message deletion, metadata writes, revision bumps and cursor clamping happen in the same critical section.
 - The cache has its own lock; invalidation and rebuild never block requests for long; background tasks are tracked in a set and their done callbacks record exceptions.
@@ -197,7 +197,7 @@ flowchart TB
 - Automatic recall defaults to `top_k=5` and `max_k=10`; each route has a 10-second timeout and the dual-route total is twice that plus one second.
 - A single injection is capped at 6000 characters and each memory at 800; agent memory tools default to 4 calls, 20 seconds and 12000 characters of output per request.
 - Embedding rebuilds default to batch size 8, concurrency 1, up to 5 retries, a 30-second exponential backoff base and 5-second request delays, which adapt to TPM rate limits.
-- Known limits: asynchronous flushes are debounced, so a hard kill may lose the last flush; trigram search depends on the SQLite build; SQLite still allows a single writer, so very large imports execute serially.
+- Known limits: asynchronous flushes are debounced, so a hard kill may lose the last flush; trigram search depends on the SQLite build; the rollback journal still allows a single writer, so very large imports execute serially.
 
 ## Data safety
 

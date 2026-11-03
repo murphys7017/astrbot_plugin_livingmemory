@@ -4,6 +4,7 @@
 """
 
 import asyncio
+import sqlite3
 from collections import OrderedDict
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -20,6 +21,9 @@ from ...storage.schema import (
     DB_VERSION_SCHEMA_STATEMENTS,
     DOCUMENTS_DOC_ID_INDEX_STATEMENT,
     DOCUMENTS_INDEX_STATEMENTS,
+    DOCUMENTS_REINDEX_NAMES,
+    DOCUMENTS_STABLE_COLUMN_DEFINITIONS,
+    DOCUMENTS_STABLE_SYNC_TRIGGER_STATEMENTS,
     MIGRATION_STATUS_SCHEMA_STATEMENTS,
 )
 from ...storage.sqlite_config import (
@@ -204,13 +208,13 @@ class MemoryEngine(
             self.db_path, timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS
         )
         self.db_connection.row_factory = aiosqlite.Row
-        await self.db_connection.execute("PRAGMA journal_mode = WAL")
         await self.db_connection.execute(
             f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}"
         )
 
         # 2. 创建表结构
         await self._create_tables()
+        await self._repair_document_indexes_if_needed()
 
         # 3. 初始化文本处理器
         stopwords_path = self.config.get("stopwords_path")
@@ -399,6 +403,36 @@ class MemoryEngine(
                     f"{', '.join(missing_columns)}"
                 )
 
+            # Remove legacy JSON expression indexes before creating stable-column
+            # indexes. This is intentionally done inside the primary write
+            # transaction so SQLite never has to maintain both generations.
+            for legacy_index in (
+                "idx_doc_metadata",
+                "idx_doc_persona_metadata",
+                "idx_doc_importance_metadata",
+                "idx_doc_last_access_metadata",
+                "idx_doc_status",
+                "idx_doc_memory_type",
+                "idx_doc_create_time",
+            ):
+                await connection.execute(f"DROP INDEX IF EXISTS {legacy_index}")
+
+            stable_columns = {
+                row[1]: row
+                for row in await (
+                    await connection.execute("PRAGMA table_xinfo(documents)")
+                ).fetchall()
+            }
+            for column_name, column_definition in DOCUMENTS_STABLE_COLUMN_DEFINITIONS:
+                existing = stable_columns.get(column_name)
+                if existing is not None and int(existing[6] or 0) in (2, 3):
+                    await connection.execute(f"ALTER TABLE documents DROP COLUMN {column_name}")
+                    existing = None
+                if existing is None:
+                    await connection.execute(
+                        f"ALTER TABLE documents ADD COLUMN {column_name} {column_definition}"
+                    )
+
             # 回填旧数据，避免 doc_id/timestamp 缺失导致删除与展示异常
             await connection.execute("""
             UPDATE documents
@@ -416,10 +450,26 @@ class MemoryEngine(
             WHERE updated_at IS NULL OR TRIM(CAST(updated_at AS TEXT)) = ''
         """)
 
+            await connection.execute(
+                """
+                UPDATE documents
+                SET lmem_session_id = CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.session_id') END,
+                    lmem_persona_id = CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.persona_id') END,
+                    lmem_importance_scaled = CASE WHEN json_valid(metadata) THEN CAST(ROUND(COALESCE(CAST(json_extract(metadata, '$.importance') AS REAL), 0) * 10000) AS INTEGER) ELSE 0 END,
+                    lmem_last_access_epoch = CASE WHEN json_valid(metadata) THEN CAST(COALESCE(CAST(json_extract(metadata, '$.last_access_time') AS REAL), 0) AS INTEGER) ELSE 0 END,
+                    lmem_create_epoch = CASE WHEN json_valid(metadata) THEN CAST(COALESCE(CAST(json_extract(metadata, '$.create_time') AS REAL), 0) AS INTEGER) ELSE 0 END,
+                    lmem_updated_epoch = CASE WHEN json_valid(metadata) THEN CAST(COALESCE(CAST(json_extract(metadata, '$.updated_at') AS REAL), 0) AS INTEGER) ELSE 0 END,
+                    lmem_status = CASE WHEN json_valid(metadata) THEN COALESCE(json_extract(metadata, '$.status'), 'active') ELSE 'active' END,
+                    lmem_memory_type = CASE WHEN json_valid(metadata) THEN UPPER(COALESCE(json_extract(metadata, '$.memory_type'), 'GENERAL')) ELSE 'GENERAL' END
+                """
+            )
+
             # 索引 DDL 与迁移/校验器共用 storage.schema 中的单一定义
             for statement in DOCUMENTS_INDEX_STATEMENTS:
                 await connection.execute(statement)
             await connection.execute(DOCUMENTS_DOC_ID_INDEX_STATEMENT)
+            for statement in DOCUMENTS_STABLE_SYNC_TRIGGER_STATEMENTS:
+                await connection.execute(statement)
 
             await connection.execute("""
             CREATE TABLE IF NOT EXISTS memory_sources (
@@ -461,6 +511,67 @@ class MemoryEngine(
                 )
 
                 logger.info(f"已初始化数据库版本信息: v{DBMigration.CURRENT_VERSION}")
+
+    async def _repair_document_indexes_if_needed(self) -> None:
+        """Rebuild known-corrupt document indexes before runtime writes begin.
+
+        SQLite can keep serving reads while an expression index is damaged, but
+        an UPDATE that touches the indexed table may then fail with
+        ``SQLITE_CORRUPT_INDEX`` (or a misleading ``SQLITE_CANTOPEN`` on some
+        Windows builds). Check the documents table once at startup and repair
+        only the indexes that protect the access-time and ordering paths.
+        """
+        if self.db_connection is None:
+            return
+
+        try:
+            cursor = await self.db_connection.execute(
+                "PRAGMA integrity_check('documents')"
+            )
+            issues = [str(row[0]) for row in await cursor.fetchall()]
+            if not issues or issues == ["ok"]:
+                return
+
+            repair_names = tuple(
+                name
+                for name in DOCUMENTS_REINDEX_NAMES
+                if any(name in issue for issue in issues)
+            )
+            if not repair_names:
+                logger.error(
+                    "[MemoryEngine] documents integrity check failed without a "
+                    "known repair target: %s",
+                    issues[:10],
+                )
+                return
+
+            async with self._write_transaction() as connection:
+                for name in repair_names:
+                    await connection.execute(f"REINDEX {name}")
+
+            verify_cursor = await self.db_connection.execute(
+                "PRAGMA integrity_check('documents')"
+            )
+            remaining = [
+                str(row[0]) for row in await verify_cursor.fetchall()
+            ]
+            if remaining != ["ok"]:
+                logger.error(
+                    "[MemoryEngine] documents indexes remain invalid after repair: %s",
+                    remaining[:10],
+                )
+                return
+            logger.warning(
+                "[MemoryEngine] repaired corrupt documents indexes: %s",
+                ", ".join(repair_names),
+            )
+        except asyncio.CancelledError:
+            raise
+        except sqlite3.DatabaseError:
+            logger.error(
+                "[MemoryEngine] documents integrity check/repair failed",
+                exc_info=True,
+            )
 
     # ==================== 核心记忆操作 ====================
 

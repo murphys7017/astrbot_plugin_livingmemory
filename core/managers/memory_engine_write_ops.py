@@ -144,29 +144,24 @@ class MemoryEngineWriteOpsMixin:
         if count <= 0 or self.db_connection is None:
             return []
 
-        conditions = [
-            "COALESCE(json_extract(metadata, '$.status'), 'active') = 'active'"
-        ]
+        conditions = ["lmem_status = 'active'"]
         params: list[Any] = []
         if session_id is not None:
-            conditions.append("json_extract(metadata, '$.session_id') = ?")
+            conditions.append("lmem_session_id = ?")
             params.append(session_id)
         if persona_id is not None:
-            conditions.append("json_extract(metadata, '$.persona_id') = ?")
+            conditions.append("lmem_persona_id = ?")
             params.append(persona_id)
         max_age_hours = max(0, int(self.config.get("recent_memory_max_age_hours", 72)))
         if max_age_hours > 0:
-            # 表达式与 idx_doc_create_time 逐字匹配，可走索引范围扫描
-            conditions.append(
-                "COALESCE(CAST(json_extract(metadata, '$.create_time') AS REAL), 0) >= ?"
-            )
+            conditions.append("lmem_create_epoch >= ?")
             params.append(time.time() - max_age_hours * 3600)
         params.append(max(count * 3, count))
 
         cursor = await self.db_connection.execute(
             "SELECT id, text, metadata FROM documents INDEXED BY idx_doc_create_time WHERE "
             + " AND ".join(conditions)
-            + " ORDER BY COALESCE(CAST(json_extract(metadata, '$.create_time') AS REAL), 0) DESC, id DESC LIMIT ?",
+            + " ORDER BY lmem_create_epoch DESC, id DESC LIMIT ?",
             params,
         )
         rows = await cursor.fetchall()

@@ -32,12 +32,11 @@ class GraphStore(GraphStoreWriteMixin, GraphStoreReadMixin, GraphStoreSnapshotMi
 
     @asynccontextmanager
     async def _connect(self):
-        """创建新的SQLite连接并启用WAL模式和busy_timeout。"""
+        """创建新的SQLite连接并设置连接级选项。"""
         db = await aiosqlite.connect(
             self.db_path, timeout=SQLITE_CONNECTION_TIMEOUT_SECONDS
         )
         try:
-            await db.execute("PRAGMA journal_mode = WAL")
             await db.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
             await db.execute("PRAGMA foreign_keys = ON")
             yield db

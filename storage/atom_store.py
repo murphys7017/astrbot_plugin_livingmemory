@@ -61,10 +61,6 @@ class AtomStore:
     async def initialize(self) -> None:
         """Create tables for memory atoms."""
         async with self._connect() as db:
-            # Set WAL once during initialization. Repeating this write-like
-            # PRAGMA on every short-lived connection creates avoidable sidecar
-            # races with the engine and graph stores.
-            await db.execute("PRAGMA journal_mode = WAL")
             await db.execute("PRAGMA foreign_keys = ON")
             await db.execute(
                 """

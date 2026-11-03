@@ -727,24 +727,24 @@ class MemoryEngineBatchMixin:
                         exc_info=True,
                     )
 
-            await self.db_connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-
-            if vacuum:
-                await self.db_connection.execute("VACUUM")
-
+            # Do not checkpoint or VACUUM a live database here. AstrBot's
+            # DocumentStorage, AtomStore, graph store and this engine each own
+            # SQLite connections. TRUNCATE requires exclusive WAL/SHM access on
+            # Windows and can make those concurrent connections report the
+            # misleading SQLITE_CANTOPEN error. Full checkpoint/VACUUM belongs
+            # to the stop-time maintenance script.
             after_size = db_path.stat().st_size if db_path.exists() else 0
             after_wal_size = wal_path.stat().st_size if wal_path.exists() else 0
             return {
                 "success": True,
-                "vacuum": vacuum,
+                "vacuum": False,
+                "vacuum_requested": vacuum,
+                "online_checkpoint_skipped": True,
                 "db_size_before": before_size,
                 "db_size_after": after_size,
                 "wal_size_before": before_wal_size,
                 "wal_size_after": after_wal_size,
-                "bytes_reclaimed": max(
-                    0,
-                    before_size + before_wal_size - after_size - after_wal_size,
-                ),
+                "bytes_reclaimed": 0,
             }
         except asyncio.CancelledError:
             raise
