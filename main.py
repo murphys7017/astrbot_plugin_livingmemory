@@ -27,6 +27,7 @@ from .core.passive_group_capture import is_plugin_enabled_for_session
 from .core.passive_group_capture import is_session_enabled
 from .core.passive_group_capture import set_active_plugin
 from .core.plugin_initializer import PluginInitializer
+from .core.prompt_cache_collector import LivingMemoryPromptCacheCollector
 from .core.tools import (
     AgenticMemorySearchTool,
     MemoryForgetTool,
@@ -34,6 +35,7 @@ from .core.tools import (
     MemoryReadTool,
     MemorySearchTool,
 )
+from .core.utils import get_persona_id
 
 _MIN_ASTRBOT_VERSION = "4.24.2"
 _ASTRBOT_DISTRIBUTION_NAMES = ("AstrBot", "astrbot")
@@ -113,6 +115,8 @@ class LivingMemoryPlugin(Star):
 
         # 初始化插件初始化器
         self.initializer = PluginInitializer(context, self.config_manager, data_dir)
+        self._prompt_cache_collector = LivingMemoryPromptCacheCollector(self)
+        context.register_prompt_extension_collector(self._prompt_cache_collector)
 
         # 事件处理器和命令处理器（初始化后创建）
         self.event_handler: EventHandler | None = None
@@ -161,6 +165,41 @@ class LivingMemoryPlugin(Star):
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         return task
+
+    async def _refresh_prompt_recall(self, event: AstrMessageEvent) -> None:
+        """Refresh LivingMemory's prompt snapshot after Personal finishes."""
+        try:
+            if self._terminating or not self.initializer.is_initialized:
+                return
+            engine = self.initializer.memory_engine
+            if engine is None:
+                return
+            session_id = str(
+                getattr(event, "unified_msg_origin", "") or ""
+            ).strip()
+            query = str(getattr(event, "message_str", "") or "").strip()
+            if not session_id or not query:
+                return
+            persona_id = await get_persona_id(self.context, event)
+            top_k = int(self.config_manager.get("recall_engine.top_k", 5) or 5)
+            if top_k <= 0:
+                return
+            await engine.search_memories(
+                query=query,
+                k=top_k,
+                session_id=session_id,
+                persona_id=persona_id,
+                allow_stale_while_refresh=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("后台刷新 LivingMemory 提示词快照失败", exc_info=True)
+
+    @filter.on_persona_expression_result(persona_segment_stream_safe=True)
+    async def handle_persona_expression_result(self, event: AstrMessageEvent, *_args):
+        """Refresh the neutral prompt snapshot without delaying delivery."""
+        self._create_tracked_task(self._refresh_prompt_recall(event))
 
     async def _initialize_plugin(self):
         """初始化插件"""
@@ -401,6 +440,9 @@ class LivingMemoryPlugin(Star):
     @filter.on_llm_request()
     async def handle_memory_recall(self, event: AstrMessageEvent, req: ProviderRequest):
         """[Event Hook] Query and inject long-term memory before LLM request"""
+        if event.get_extra("_interaction_execution_surface") == "personal_expression":
+            logger.debug("Personal 请求只读取 LivingMemory 快照，跳过同步召回")
+            return
         ready, _ = await self._ensure_plugin_ready(wait=False)
         if not ready:
             logger.debug("插件未完成初始化，跳过记忆召回")

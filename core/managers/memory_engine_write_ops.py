@@ -278,6 +278,25 @@ class MemoryEngineWriteOpsMixin:
         self._prompt_recall_cache.move_to_end(scope_key)
         return copy.deepcopy(results)
 
+    def get_prompt_recall_snapshot(
+        self,
+        session_id: str | None,
+        persona_id: str | None,
+        *,
+        limit: int = 5,
+    ) -> list[HybridResult]:
+        """Read the last completed prompt recall without starting a search.
+
+        This is the synchronous reader used by the Personal prompt boundary.
+        Cache misses intentionally return an empty list; refreshes are owned by
+        the background writer path so a realtime request never performs vector
+        or BM25 retrieval here.
+        """
+        snapshot = self._get_prompt_recall_snapshot(session_id, persona_id)
+        if not snapshot:
+            return []
+        return snapshot[: max(0, int(limit))]
+
     def _remember_prompt_recall_snapshot(
         self,
         session_id: str | None,
