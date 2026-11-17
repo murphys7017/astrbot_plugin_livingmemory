@@ -302,6 +302,11 @@ def install_async_persist(
     """
     if storage is None or not getattr(storage, "path", None):
         return None
+    # Newer hosts already own checkpoint scheduling, locking and close-time flush.
+    set_writer = getattr(storage, "set_index_writer", None)
+    if callable(set_writer):
+        set_writer(_write_index_atomic)
+        return None
     existing = get_async_persister(storage)
     if existing is not None:
         return existing

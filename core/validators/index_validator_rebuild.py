@@ -679,6 +679,8 @@ class IndexValidatorRebuildMixin:
                     await persister.flush_now()
                 except Exception:
                     logger.warning("重建前落盘旧索引失败，继续重建流程", exc_info=True)
+            elif callable(getattr(embedding_storage, "flush", None)):
+                await embedding_storage.flush()
             if temp_path:
                 os.replace(temp_path, index_path)
             if metadata_path and os.path.exists(metadata_path):
