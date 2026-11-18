@@ -2,6 +2,9 @@
   <strong>中文</strong> · <a href="README_en.md">English</a> · <a href="README_ru.md">Русский</a>
 </p>
 
+**AG99 定制版本**　murphys7017 为 AG99 桌宠维护的修改保存在 [`codex/olv-recall-stale-refresh` 分支](https://github.com/murphys7017/astrbot_plugin_livingmemory/tree/codex/olv-recall-stale-refresh)。该分支的 README 记录了与上游的具体差异。 [上游项目](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory)
+
+
 ![LivingMemory：连接偏好、人物、计划与上下文的长期记忆](docs/public/images/livingmemory-cover.svg)
 
 <p align="center">
