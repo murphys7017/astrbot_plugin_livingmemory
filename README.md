@@ -2,6 +2,8 @@
   <strong>中文</strong> · <a href="README_en.md">English</a> · <a href="README_ru.md">Русский</a>
 </p>
 
+**AG99 定制分支**　此版本由 murphys7017 基于 lxfight 团队的 LivingMemory 修改，针对 AG99 调整了召回快照刷新、SQLite 维护和向量索引写盘。下方的通用使用文档与版本发布由上游维护。 [LivingMemory 上游](https://github.com/lxfight-s-Astrbot-Plugins/astrbot_plugin_livingmemory) · [AG99 定制源码](https://github.com/murphys7017/astrbot_plugin_livingmemory/tree/codex/olv-recall-stale-refresh)
+
 ![LivingMemory：连接偏好、人物、计划与上下文的长期记忆](docs/public/images/livingmemory-cover.svg)
 
 <p align="center">

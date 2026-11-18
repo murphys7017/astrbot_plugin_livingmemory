@@ -128,10 +128,16 @@ class AtomStore:
             atom_count = int((await cursor.fetchone())[0])
             if fts_count != atom_count:
                 await db.execute("DELETE FROM memory_atoms_fts")
-                await db.execute(
-                    "INSERT INTO memory_atoms_fts(atom_id, content) "
-                    "SELECT id, content FROM memory_atoms"
+                rows_cursor = await db.execute(
+                    "SELECT id, content FROM memory_atoms ORDER BY id"
                 )
+                rows = await rows_cursor.fetchall()
+                for start in range(0, len(rows), self._SQLITE_BATCH_SIZE):
+                    await db.executemany(
+                        "INSERT INTO memory_atoms_fts(atom_id, content) "
+                        "VALUES (?, ?)",
+                        rows[start : start + self._SQLITE_BATCH_SIZE],
+                    )
                 logger.info(
                     f"[AtomStore] 原子 FTS 索引不一致（{fts_count}/{atom_count}），已从源表重建"
                 )
