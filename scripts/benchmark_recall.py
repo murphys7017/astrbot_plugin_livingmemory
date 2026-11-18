@@ -151,8 +151,11 @@ async def benchmark(args):
                 )
             finally:
                 await engine.close()
-                await persister.aclose()
-                await db.close()
+                try:
+                    if persister is not None:
+                        await persister.aclose()
+                finally:
+                    await db.close()
 
 
 if __name__ == "__main__":

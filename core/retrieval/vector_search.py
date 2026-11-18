@@ -60,7 +60,7 @@ async def retrieve_vectors(db, query, k, filters, *, source_key="id"):
             if persister is not None:
                 scores, indices = await persister.search(vector, fetch_k)
             else:
-                scores, indices = await storage.search(vector, fetch_k)
+                scores, indices = await storage.search(vector.reshape(1, -1), fetch_k)
             ids = [int(value) for value in indices[0] if value >= 0]
             new_ids = [doc_id for doc_id in ids if doc_id not in documents_by_id]
             if new_ids:

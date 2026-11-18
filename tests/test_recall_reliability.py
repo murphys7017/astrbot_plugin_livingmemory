@@ -73,10 +73,13 @@ async def engine(tmp_path):
     try:
         yield memory
     finally:
-        for persister in persisters:
-            await persister.aclose()
-        await memory.close()
-        await document_db.close()
+        try:
+            for persister in persisters:
+                if persister is not None:
+                    await persister.aclose()
+        finally:
+            await memory.close()
+            await document_db.close()
 
 
 @pytest.mark.asyncio
